@@ -2,9 +2,11 @@ import anthropic
 import google.generativeai as genai
 from app.config import get_settings
 import logging
+import base64 as b64lib
 
 logger = logging.getLogger(__name__)
 CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
+CLAUDE_SONNET = "claude-sonnet-4-6"
 GEMINI_FLASH = "gemini-2.0-flash"
 MAX_RESPONSE_TOKENS = 300
 
@@ -51,6 +53,82 @@ Responda APENAS o JSON."""
             return json.loads(response.content[0].text.strip())
         except Exception:
             return {"intent": "outros", "lead_score_delta": 0, "is_simple": False, "urgency": "media"}
+
+    # ── HELPERS DE MÍDIA ──────────────────────────────────────────────────────
+
+    def _parse_base64(self, b64: str) -> tuple:
+        """Remove prefixo data URL se existir. Retorna (base64_limpo, mime_type)."""
+        if b64 and b64.startswith("data:") and "," in b64:
+            header, data = b64.split(",", 1)
+            mime = header.split(":")[1].split(";")[0]
+            return data, mime
+        return b64, ""
+
+    async def respond_with_image(self, system_prompt: str, history: list, user_message: str, image_base64: str) -> str:
+        """Responde analisando uma imagem via Claude Vision."""
+        try:
+            data, mime = self._parse_base64(image_base64)
+            mime = mime or "image/jpeg"
+            caption_text = user_message if user_message and not user_message.startswith("[Imagem") else "Descreva o que tem nessa imagem e responda conforme seu papel de atendente."
+            messages = history + [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}},
+                    {"type": "text", "text": caption_text}
+                ]
+            }]
+            response = self.claude.messages.create(
+                model=CLAUDE_HAIKU, max_tokens=MAX_RESPONSE_TOKENS,
+                system=system_prompt, messages=messages
+            )
+            return response.content[0].text.strip()
+        except Exception as e:
+            logger.error(f"Erro ao processar imagem: {e}")
+            return "Recebi sua imagem! Pode me descrever o que você precisa sobre ela?"
+
+    async def respond_with_pdf(self, system_prompt: str, history: list, user_message: str, pdf_base64: str) -> str:
+        """Lê e responde sobre um PDF via Claude (suporte nativo a documentos)."""
+        try:
+            data, _ = self._parse_base64(pdf_base64)
+            doc_text = user_message if user_message and not user_message.startswith("[PDF") else "Resuma o conteúdo deste documento de forma útil."
+            messages = history + [{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}},
+                    {"type": "text", "text": doc_text}
+                ]
+            }]
+            response = self.claude.messages.create(
+                model=CLAUDE_SONNET, max_tokens=MAX_RESPONSE_TOKENS,
+                system=system_prompt, messages=messages
+            )
+            return response.content[0].text.strip()
+        except Exception as e:
+            logger.error(f"Erro ao processar PDF: {e}")
+            return "Recebi o documento! Pode me dizer o que você quer saber sobre ele?"
+
+    async def transcribe_audio(self, audio_base64: str) -> str:
+        """Transcreve áudio usando Gemini (suporta OGG/Opus do WhatsApp)."""
+        if not self.gemini:
+            return ""
+        try:
+            data, mime = self._parse_base64(audio_base64)
+            mime = mime or "audio/ogg"
+            audio_bytes = b64lib.b64decode(data)
+            response = self.gemini.generate_content(
+                contents=[{
+                    "parts": [
+                        {"inline_data": {"mime_type": mime, "data": b64lib.b64encode(audio_bytes).decode()}},
+                        {"text": "Transcreva este áudio em português. Responda APENAS com a transcrição literal, sem comentários."}
+                    ]
+                }]
+            )
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"Erro ao transcrever áudio: {e}")
+            return ""
+
+    # ── FIM HELPERS DE MÍDIA ──────────────────────────────────────────────────
 
     async def compress_conversation(self, messages: list) -> str:
         text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])

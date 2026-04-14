@@ -22,7 +22,8 @@ async def receive_whatsapp(request: Request):
     if not owner:
         return {"status": "owner_not_found"}
     process_message.apply_async(
-        args=[message.phone, owner["id"], message.message, owner.get("agent_mode", "both")],
+        args=[message.phone, owner["id"], message.message, owner.get("agent_mode", "both"),
+              message.message_id, message.media_type or "text"],
         queue="messages",
         routing_key=f"phone.{message.phone}"
     )

@@ -25,23 +25,25 @@ def run_async(coro):
         loop.close()
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
-def process_message(self, phone: str, owner_id: str, message: str, agent_mode: str):
+def process_message(self, phone: str, owner_id: str, message: str, agent_mode: str,
+                    message_id: str = "", media_type: str = "text"):
     try:
+        kwargs = {"message_id": message_id, "media_type": media_type}
         if agent_mode == "qualifier":
             from app.agents.qualifier import QualifierAgent
-            run_async(QualifierAgent().process(phone, owner_id, message))
+            run_async(QualifierAgent().process(phone, owner_id, message, **kwargs))
         elif agent_mode == "attendant":
             from app.agents.attendant import AttendantAgent
-            run_async(AttendantAgent().process(phone, owner_id, message))
+            run_async(AttendantAgent().process(phone, owner_id, message, **kwargs))
         elif agent_mode == "both":
             from app.services.memory import MemoryService
             customer = run_async(MemoryService().get_or_create_customer(phone, owner_id))
             if customer.lead_status in ["cliente"]:
                 from app.agents.attendant import AttendantAgent
-                run_async(AttendantAgent().process(phone, owner_id, message))
+                run_async(AttendantAgent().process(phone, owner_id, message, **kwargs))
             else:
                 from app.agents.qualifier import QualifierAgent
-                run_async(QualifierAgent().process(phone, owner_id, message))
+                run_async(QualifierAgent().process(phone, owner_id, message, **kwargs))
     except Exception as exc:
         logger.error(f"Erro ao processar mensagem de {phone}: {exc}")
         raise self.retry(exc=exc)

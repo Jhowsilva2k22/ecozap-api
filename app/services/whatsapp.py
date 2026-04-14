@@ -32,7 +32,7 @@ class WhatsAppService:
     async def send_typing(self, phone: str, duration: int = 3000):
         url = f"{self.base_url}/chat/sendPresence/{self.settings.evolution_instance}"
         phone = self._format_phone(phone)
-        payload = {"number": phone, "options": {"presence": "composing", "delay": duration}}
+        payload = {"number": phone, "presence": "composing", "delay": duration}
         async with httpx.AsyncClient(timeout=10) as client:
             try:
                 await client.post(url, json=payload, headers=self.headers)
