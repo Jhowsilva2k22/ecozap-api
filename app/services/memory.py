@@ -16,7 +16,7 @@ class MemoryService:
         if result and result.data:
             return CustomerProfile(**result.data)
         new_customer = CustomerProfile(phone=phone, owner_id=owner_id, first_contact=datetime.utcnow(), last_contact=datetime.utcnow())
-        self.db.table("customers").insert(new_customer.model_dump()).execute()
+        self.db.table("customers").insert(new_customer.model_dump(mode='json')).execute()
         return new_customer
 
     async def update_customer(self, phone: str, owner_id: str, updates: dict):
