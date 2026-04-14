@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     evolution_api_key: str
     evolution_instance: str
     redis_url: str = "redis://localhost:6379/0"
+    openai_api_key: str = ""
     firecrawl_api_key: str = ""
     app_secret: str = "secret"
     app_url: str = "http://localhost:8000"

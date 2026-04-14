@@ -3,6 +3,7 @@ import google.generativeai as genai
 from app.config import get_settings
 import logging
 import base64 as b64lib
+import io
 
 logger = logging.getLogger(__name__)
 CLAUDE_HAIKU = "claude-haiku-4-5-20251001"
@@ -19,6 +20,12 @@ class AIService:
             self.gemini = genai.GenerativeModel(GEMINI_FLASH)
         else:
             self.gemini = None
+        # OpenAI para Whisper
+        if settings.openai_api_key:
+            from openai import OpenAI
+            self.openai = OpenAI(api_key=settings.openai_api_key)
+        else:
+            self.openai = None
 
     async def respond(self, system_prompt: str, history: list, user_message: str, use_gemini: bool = False) -> str:
         if use_gemini and self.gemini:
@@ -116,25 +123,44 @@ Responda APENAS o JSON."""
             return "Recebi o documento! Pode me dizer o que você quer saber sobre ele?"
 
     async def transcribe_audio(self, audio_base64: str) -> str:
-        """Transcreve áudio usando Gemini (suporta OGG/Opus do WhatsApp)."""
-        if not self.gemini:
-            return ""
-        try:
-            data, mime = self._parse_base64(audio_base64)
-            mime = mime or "audio/ogg"
-            audio_bytes = b64lib.b64decode(data)
-            response = self.gemini.generate_content(
-                contents=[{
-                    "parts": [
-                        {"inline_data": {"mime_type": mime, "data": b64lib.b64encode(audio_bytes).decode()}},
-                        {"text": "Transcreva este áudio em português. Responda APENAS com a transcrição literal, sem comentários."}
-                    ]
-                }]
-            )
-            return response.text.strip()
-        except Exception as e:
-            logger.error(f"Erro ao transcrever áudio: {e}")
-            return ""
+        """Transcreve áudio — usa Whisper (OpenAI) se disponível, senão Gemini."""
+        data, mime = self._parse_base64(audio_base64)
+        audio_bytes = b64lib.b64decode(data)
+
+        # ── Whisper (OpenAI) — prioridade ─────────────────────────────────────
+        if self.openai:
+            try:
+                audio_file = io.BytesIO(audio_bytes)
+                audio_file.name = "audio.ogg"
+                transcript = self.openai.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language="pt",
+                    response_format="text"
+                )
+                text = transcript.strip() if isinstance(transcript, str) else transcript.text.strip()
+                logger.info(f"[Whisper] transcrição OK: {text[:60]}")
+                return text
+            except Exception as e:
+                logger.error(f"[Whisper] erro: {e} — tentando Gemini como fallback")
+
+        # ── Gemini — fallback ─────────────────────────────────────────────────
+        if self.gemini:
+            try:
+                mime = mime or "audio/ogg"
+                response = self.gemini.generate_content(
+                    contents=[{
+                        "parts": [
+                            {"inline_data": {"mime_type": mime, "data": b64lib.b64encode(audio_bytes).decode()}},
+                            {"text": "Transcreva este áudio em português. Responda APENAS com a transcrição literal, sem comentários."}
+                        ]
+                    }]
+                )
+                return response.text.strip()
+            except Exception as e:
+                logger.error(f"[Gemini] erro na transcrição: {e}")
+
+        return ""
 
     # ── FIM HELPERS DE MÍDIA ──────────────────────────────────────────────────
 
