@@ -48,7 +48,7 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
     """Processa mensagens agrupadas do buffer Redis (rate limiting).
-    Mídias são pré-processadas individualmente, textos são agrupados."""
+    Mídias são pré-analisadas e tudo vira uma mensagem unificada pro agente."""
     import json as _json
     import redis
 
@@ -57,7 +57,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
         buffer_key = f"buffer:{phone}:{owner_id}"
         task_key = f"buffer_task:{phone}:{owner_id}"
 
-        # Pega todas as mensagens do buffer
         raw_msgs = _redis.lrange(buffer_key, 0, -1)
         _redis.delete(buffer_key)
         _redis.delete(task_key)
@@ -73,31 +72,7 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
         media_msgs = [m for m in msgs if m.get("media_type", "text") != "text" and m.get("message_id")]
         text_parts = [m["text"] for m in msgs if m.get("text")]
 
-        # Se tem mídias, processa cada uma individualmente via agente
-        if media_msgs:
-            # Se tem só mídias (sem texto adicional), processa cada uma
-            # Se tem mídias + texto, processa mídias primeiro e texto junto com a última
-            for i, media in enumerate(media_msgs):
-                is_last_media = (i == len(media_msgs) - 1)
-                # Última mídia carrega o texto combinado junto
-                if is_last_media and text_parts:
-                    msg_text = "\n".join(text_parts)
-                else:
-                    msg_text = media.get("text", "") or ""
-
-                if not msg_text and media.get("media_type") == "image":
-                    msg_text = "[Imagem enviada]"
-                elif not msg_text and media.get("media_type") == "audio":
-                    msg_text = "[Áudio enviado]"
-                elif not msg_text and media.get("media_type") == "document":
-                    msg_text = "[Documento enviado]"
-
-                kwargs = {
-                    "message_id": media.get("message_id", ""),
-                    "media_type": media.get("media_type", "text")
-                }
-                _dispatch_to_agent(phone, owner_id, msg_text, agent_mode, **kwargs)
-        else:
+        if not media_msgs:
             # Só textos — junta tudo e processa como antes
             combined_text = "\n".join(text_parts) if text_parts else ""
             if not combined_text:
@@ -105,6 +80,59 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                 return
             kwargs = {"message_id": msgs[-1].get("message_id", ""), "media_type": "text"}
             _dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs)
+            return
+
+        # Se tem 1 mídia só, processa normal (agente lida com ela direto)
+        if len(media_msgs) == 1 and len(text_parts) <= 1:
+            m = media_msgs[0]
+            msg_text = text_parts[0] if text_parts else (m.get("text") or "")
+            kwargs = {"message_id": m.get("message_id", ""), "media_type": m.get("media_type", "text")}
+            _dispatch_to_agent(phone, owner_id, msg_text, agent_mode, **kwargs)
+            return
+
+        # Múltiplas mídias: pré-analisa cada uma e manda tudo junto como texto
+        from app.services.whatsapp import WhatsAppService
+        from app.services.ai import AIService
+        wa = WhatsAppService()
+        ai = AIService()
+        descriptions = []
+
+        for i, media in enumerate(media_msgs, 1):
+            mid = media.get("message_id", "")
+            mtype = media.get("media_type", "")
+            try:
+                b64 = run_async(wa.download_media_base64(mid, phone=phone))
+                if not b64:
+                    descriptions.append(f"[Mídia {i}: não foi possível baixar]")
+                    continue
+
+                if mtype == "image":
+                    desc = run_async(ai.respond_with_image(
+                        system_prompt="Descreva esta imagem em 1-2 frases objetivas: o que é, marca, detalhes visíveis. Só a descrição, sem comentários.",
+                        history=[], user_message="Descreva esta imagem.", image_base64=b64
+                    ))
+                    descriptions.append(f"[Imagem {i}]: {desc}")
+                elif mtype == "audio":
+                    text = run_async(ai.transcribe_audio(b64))
+                    descriptions.append(f"[Áudio {i}]: {text}" if text else f"[Áudio {i}: não transcrito]")
+                elif mtype == "document":
+                    desc = run_async(ai.respond_with_pdf(
+                        system_prompt="Resuma o conteúdo deste documento em 1-2 frases.",
+                        history=[], user_message="Resuma este documento.", pdf_base64=b64
+                    ))
+                    descriptions.append(f"[Documento {i}]: {desc}")
+            except Exception as e:
+                logger.error(f"[Buffer] Erro pré-analisando mídia {i}: {e}")
+                descriptions.append(f"[Mídia {i}: erro ao processar]")
+
+        # Combina descrições das mídias + textos do lead em uma mensagem só
+        all_parts = descriptions + (["\n".join(text_parts)] if text_parts else [])
+        combined = "\n".join(all_parts)
+        logger.info(f"[Buffer] Mídia unificada para {phone}: {len(media_msgs)} mídias + {len(text_parts)} textos")
+
+        # Manda pro agente como texto (todas as mídias já foram descritas)
+        kwargs = {"message_id": "", "media_type": "text"}
+        _dispatch_to_agent(phone, owner_id, combined, agent_mode, **kwargs)
 
     except Exception as exc:
         logger.error(f"[Buffer] Erro ao processar buffer de {phone}: {exc}")
