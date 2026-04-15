@@ -2,13 +2,20 @@ from fastapi import APIRouter, Request, HTTPException
 from app.services.whatsapp import WhatsAppService
 from app.services.memory import MemoryService
 from app.queues.tasks import process_message, learn_from_links
+from app.config import get_settings
 import logging
 import re
+import redis
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 whatsapp = WhatsAppService()
 memory = MemoryService()
+
+# Redis para deduplicação
+_settings = get_settings()
+_redis = redis.from_url(_settings.redis_url, decode_responses=True)
+DEDUP_TTL = 120  # segundos — janela de proteção contra duplicatas
 
 # Prefixos que o DONO usa para ensinar o bot
 LEARN_PREFIXES = ("aprender:", "aprender ", "configurar:", "configurar ", "link:", "base:")
@@ -28,6 +35,18 @@ async def receive_whatsapp(request: Request):
     message = whatsapp.parse_webhook(payload)
     if not message:
         return {"status": "ignored"}
+
+    # ── Deduplicação por message_id ──────────────────────────────────────────
+    if message.message_id:
+        dedup_key = f"dedup:{message.message_id}"
+        try:
+            already_seen = _redis.get(dedup_key)
+            if already_seen:
+                logger.info(f"[Webhook] Duplicata ignorada: {message.message_id}")
+                return {"status": "duplicate"}
+            _redis.setex(dedup_key, DEDUP_TTL, "1")
+        except Exception as e:
+            logger.warning(f"[Webhook] Redis dedup falhou (continuando): {e}")
 
     owner = await _get_owner_by_instance(message.instance)
     if not owner:
