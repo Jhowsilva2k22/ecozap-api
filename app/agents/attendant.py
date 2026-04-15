@@ -1,6 +1,7 @@
 from app.services.ai import AIService
 from app.services.memory import MemoryService
 from app.services.whatsapp import WhatsAppService
+from app.agents.qualifier import _detect_channel
 import logging
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,18 @@ class AttendantAgent:
             media_base64 = None
             media_type = "text"
         # ────────────────────────────────────────────────────────────────────
+
+        # ── Captura de nome ──────────────────────────────────────────────────
+        if not customer.name:
+            detected_name = await self.memory.detect_and_save_name(phone, owner_id, display_message)
+            if detected_name:
+                customer = await self.memory.get_or_create_customer(phone, owner_id)
+
+        # ── Detecção de canal de origem (primeira mensagem) ──────────────────
+        if not customer.channel and (customer.total_messages or 0) == 0:
+            channel = _detect_channel(display_message)
+            if channel:
+                await self.memory.set_channel(phone, owner_id, channel)
 
         classification = await self.ai.classify_intent(display_message, context=customer.summary or "")
         is_simple = classification.get("is_simple", False)

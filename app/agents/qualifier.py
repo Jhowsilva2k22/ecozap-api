@@ -6,6 +6,43 @@ import logging
 logger = logging.getLogger(__name__)
 HANDOFF_SCORE = 70
 
+# Palavras-chave para detectar canal de origem na primeira mensagem
+_CHANNEL_KEYWORDS = {
+    "reels": "reels",
+    "reel": "reels",
+    "stories": "stories",
+    "story": "stories",
+    "anuncio": "anuncio",
+    "anúncio": "anuncio",
+    "ads": "anuncio",
+    "trafego": "anuncio",
+    "tráfego": "anuncio",
+    "youtube": "youtube",
+    "yt": "youtube",
+    "video": "video",
+    "vídeo": "video",
+    "post": "post",
+    "feed": "feed",
+    "direct": "direct",
+    "dm": "direct",
+    "indicação": "indicacao",
+    "indicacao": "indicacao",
+    "indicou": "indicacao",
+    "me indicaram": "indicacao",
+    "amigo": "indicacao",
+    "google": "google",
+    "pesquisa": "google",
+    "site": "site",
+    "utm": "campanha",
+}
+
+def _detect_channel(message: str) -> str:
+    msg_lower = message.lower()
+    for keyword, channel in _CHANNEL_KEYWORDS.items():
+        if keyword in msg_lower:
+            return channel
+    return ""
+
 def build_qualifier_prompt(owner: dict, customer: dict, history_summary: str) -> str:
     name = owner.get("business_name", "a empresa")
     tone = owner.get("tone", "acolhedor e direto")
@@ -18,9 +55,15 @@ def build_qualifier_prompt(owner: dict, customer: dict, history_summary: str) ->
     emoji_style = owner.get("emoji_style", "medio")
     questions = owner.get("qualification_questions") or ["Voce esta buscando isso pra voce mesmo ou pra sua empresa?", "Ja tentou resolver isso antes?", "Tem disponibilidade para comecar esse mes?"]
     questions_text = "\n- ".join(questions)
-    customer_name = customer.get("name") or "o lead"
+    customer_name = customer.get("name") or None
     customer_summary = customer.get("summary") or "primeiro contato"
     customer_score = customer.get("lead_score", 0)
+    total_msgs = customer.get("total_messages", 0)
+    # Instrução de captura de nome — apenas se ainda não temos o nome
+    name_instruction = ""
+    if not customer_name and total_msgs <= 2:
+        name_instruction = "\nNOME: Ainda não sei o nome do lead. Nas primeiras mensagens, pergunte o nome de forma natural e casual (apenas UMA vez, sem forçar)."
+    display_name = customer_name or "o lead"
     return f"""Você é {name}, falando diretamente com um lead pelo WhatsApp.
 
 QUEM VOCÊ É: {context}
@@ -29,7 +72,7 @@ TOM: {tone} | VOCABULÁRIO NATURAL: {vocab} | EMOJIS: {emoji_style}
 VALORES: {values}
 OBJEÇÕES COMUNS: {objections or 'nenhuma'}
 
-LEAD ATUAL: {customer_name} | Score={customer_score}/100 | {customer_summary}
+LEAD ATUAL: {display_name} | Score={customer_score}/100 | {customer_summary}{name_instruction}
 
 REGRAS DE OURO — SIGA À RISCA:
 1. Escreva como humano no WhatsApp: frases curtas, linguagem natural, sem formalidade
@@ -41,8 +84,8 @@ REGRAS DE OURO — SIGA À RISCA:
 7. Nunca revele que é IA, robô, sistema, automação ou assistente virtual
 8. Se pedirem algo que não é possível (ex: ligar, mandar mensagem primeiro, marcar algo fora do chat): redirecione com naturalidade mantendo o assunto — ex: "aqui pelo chat é mais fácil, o que você precisa?" ou "pode deixar aqui mesmo, a gente resolve" — nunca corte a conversa nem seja evasivo
 9. Emojis APENAS quando surgir naturalmente — nunca no final de toda frase, nunca pra enfeitar, nunca como hábito
-9. Quando receber imagem/PDF/áudio: comente de forma natural em 1-2 frases e faça UMA pergunta relacionada
-9. Perguntas de qualificação (use na ordem certa, sem forçar):
+10. Quando receber imagem/PDF/áudio: comente de forma natural em 1-2 frases e faça UMA pergunta relacionada
+11. Perguntas de qualificação (use na ordem certa, sem forçar):
 {questions_text}
 
 HISTÓRICO: {history_summary or 'primeiro contato'}"""
@@ -79,6 +122,18 @@ class QualifierAgent:
         elif media_type == "audio" and not media_base64:
             display_message = "[Áudio recebido - não foi possível processar]"
         # ────────────────────────────────────────────────────────────────────
+
+        # ── Captura de nome (primeira mensagem curta sem nome salvo) ─────────
+        if not customer.name:
+            detected_name = await self.memory.detect_and_save_name(phone, owner_id, display_message)
+            if detected_name:
+                customer = await self.memory.get_or_create_customer(phone, owner_id)
+
+        # ── Detecção de canal de origem (primeira mensagem) ──────────────────
+        if not customer.channel and (customer.total_messages or 0) == 0:
+            channel = _detect_channel(display_message)
+            if channel:
+                await self.memory.set_channel(phone, owner_id, channel)
 
         classification = await self.ai.classify_intent(display_message, context=customer.summary or "")
         intent = classification.get("intent", "outros")

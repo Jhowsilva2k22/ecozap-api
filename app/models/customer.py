@@ -19,3 +19,4 @@ class CustomerProfile(BaseModel):
     interests: Optional[list] = None
     total_messages: int = 0
     owner_id: str = ""
+    channel: Optional[str] = None

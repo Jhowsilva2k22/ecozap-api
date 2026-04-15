@@ -14,8 +14,16 @@ celery_app.conf.update(
     task_routes={
         "app.queues.tasks.process_message": {"queue": "messages"},
         "app.queues.tasks.nightly_learning": {"queue": "learning"},
+        "app.queues.tasks.nightly_learning_all": {"queue": "learning"},
         "app.queues.tasks.learn_from_links": {"queue": "learning"},
-    }
+    },
+    beat_schedule={
+        "nightly-learning-all": {
+            "task": "app.queues.tasks.nightly_learning_all",
+            "schedule": 86400.0,  # 24h em segundos
+            "options": {"queue": "learning"},
+        }
+    },
 )
 
 def run_async(coro):
@@ -53,6 +61,30 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
 def nightly_learning(owner_id: str):
     from app.services.learning import LearningService
     run_async(LearningService().run_daily_analysis(owner_id))
+
+
+@celery_app.task(queue="learning")
+def nightly_learning_all():
+    """Roda o aprendizado noturno para todos os donos cadastrados."""
+    from app.database import get_db
+    from app.services.learning import LearningService
+    db = get_db()
+    result = db.table("owners").select("id,phone,business_name").execute()
+    if not result.data:
+        logger.info("[NightlyAll] Nenhum owner encontrado.")
+        return
+    learning = LearningService()
+    success = 0
+    errors = 0
+    for owner in result.data:
+        try:
+            run_async(learning.run_daily_analysis(owner["id"]))
+            success += 1
+            logger.info(f"[NightlyAll] ✅ {owner.get('business_name', owner['id'])}")
+        except Exception as e:
+            errors += 1
+            logger.error(f"[NightlyAll] ❌ {owner['id']}: {e}")
+    logger.info(f"[NightlyAll] Concluído: {success} ok, {errors} erros.")
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=10, queue="learning")
