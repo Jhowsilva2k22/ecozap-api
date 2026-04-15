@@ -28,52 +28,6 @@ app.include_router(panel.router, tags=["Panel"])
 async def root():
     return {"service": "WhatsApp AI Agent", "status": "online", "version": "1.0.0"}
 
-@app.get("/debug/ig-migrate")
-async def ig_migrate():
-    """Temporario: adiciona instagram_account_id na tabela owners e preenche."""
-    import httpx
-    s = get_settings()
-    headers = {
-        "apikey": s.supabase_service_key,
-        "Authorization": f"Bearer {s.supabase_service_key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    }
-    base = s.supabase_url.rstrip("/")
-    results = []
-    async with httpx.AsyncClient(timeout=15) as c:
-        # 1. Adiciona coluna
-        r1 = await c.post(f"{base}/rest/v1/rpc/exec_sql", headers=headers,
-                          json={"query": "ALTER TABLE owners ADD COLUMN IF NOT EXISTS instagram_account_id TEXT;"})
-        results.append({"add_column": r1.status_code, "body": r1.text[:200]})
-        # 2. Preenche com o ID do Instagram
-        r2 = await c.patch(f"{base}/rest/v1/owners?id=not.is.null",
-                           headers={**headers, "Prefer": "return=minimal"},
-                           json={"instagram_account_id": s.instagram_account_id})
-        results.append({"update_owners": r2.status_code, "body": r2.text[:200]})
-    return {"results": results}
-
-@app.get("/debug/ig-check")
-async def ig_check():
-    """Endpoint temporario de diagnostico — REMOVER DEPOIS."""
-    s = get_settings()
-    from app.services.memory import MemoryService
-    mem = MemoryService()
-    owners = []
-    try:
-        result = mem.db.table("owners").select("*").limit(1).execute()
-        owners = list((result.data[0] if result.data else {}).keys()) if result.data else ["NO_OWNERS"]
-    except Exception as e:
-        owners = [{"error": str(e)}]
-    return {
-        "meta_page_id": s.meta_page_id[:6] + "..." if s.meta_page_id else "NAO_CONFIGURADO",
-        "meta_page_token": s.meta_page_token[:10] + "..." if s.meta_page_token else "NAO_CONFIGURADO",
-        "instagram_account_id": s.instagram_account_id or "NAO_CONFIGURADO",
-        "meta_verify_token": s.meta_verify_token or "NAO_CONFIGURADO",
-        "owners_with_ig": owners,
-    }
-
-
 async def _subscribe_instagram_webhook():
     """Garante que a Page está inscrita no webhook de mensagens do Instagram."""
     url = f"https://graph.facebook.com/v21.0/{settings.meta_page_id}/subscribed_apps"
