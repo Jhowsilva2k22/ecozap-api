@@ -29,3 +29,24 @@ async def root():
 async def startup():
     logger.info("WhatsApp AI Agent iniciado")
     logger.info(f"Instancia Evolution: {settings.evolution_instance}")
+    # Verifica colunas do banco
+    try:
+        from app.migrations import run_migrations
+        result = await run_migrations()
+        if result.get("missing"):
+            logger.warning(f"⚠️ COLUNAS FALTANDO NO BANCO: {result['missing']}")
+    except Exception as e:
+        logger.error(f"Erro na verificação de migração: {e}")
+
+
+@app.get("/api/migrate")
+async def migrate(token: str = ""):
+    """Verifica colunas e retorna SQL de migração se necessário."""
+    if token != settings.app_secret:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token inválido")
+    from app.migrations import run_migrations, get_migration_sql
+    result = await run_migrations()
+    if result.get("missing"):
+        result["migration_sql"] = get_migration_sql()
+    return result
