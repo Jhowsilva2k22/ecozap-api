@@ -180,31 +180,111 @@ async def receive_whatsapp(request: Request):
             await whatsapp.send_message(message.phone, f"📊 Acesse seu painel:\n👉 {panel}")
             return {"status": "panel_sent"}
 
-        # CAMPANHA: disparo ativo segmentado
-        if any(msg_lower.startswith(p) for p in CAMPAIGN_PREFIX):
-            for p in CAMPAIGN_PREFIX:
-                if msg_lower.startswith(p):
-                    campaign_text = raw_text[len(p):].strip()
-                    break
-            if not campaign_text:
+        # ── CAMPANHA: wizard conversacional ──────────────────────────────
+        campaign_key = f"campaign_wizard:{owner['id']}"
+        campaign_state = _redis.hgetall(campaign_key)
+
+        # /campanha inicia o wizard
+        if msg_lower.strip() in ("/campanha", "/campanha:"):
+            _redis.hset(campaign_key, mapping={"step": "publico"})
+            _redis.expire(campaign_key, 600)  # 10 min timeout
+            await whatsapp.send_message(message.phone,
+                "📢 *Vamos criar sua campanha!*\n\n"
+                "Primeiro, pra quem é?\n\n"
+                "1️⃣ Todos os leads\n"
+                "2️⃣ Só mornos pra cima (score 40+)\n"
+                "3️⃣ Só quentes (score 70+)\n"
+                "4️⃣ Só clientes\n\n"
+                "Responda com o número ou descreva (ex: 'mornos e quentes')"
+            )
+            return {"status": "campaign_step_publico"}
+
+        # Wizard ativo — processa resposta
+        if campaign_state and campaign_state.get("step"):
+            step = campaign_state["step"]
+
+            # PASSO 1: Público
+            if step == "publico":
+                # Parseia público
+                pub = msg_lower.strip()
+                if pub in ("1", "todos", "todos os leads"):
+                    target = "todos"
+                    target_label = "todos os leads"
+                elif pub in ("2", "mornos", "mornos pra cima", "morno"):
+                    target = "mornos+"
+                    target_label = "mornos pra cima (score 40+)"
+                elif pub in ("3", "quentes", "quente", "quentes pra cima"):
+                    target = "quentes"
+                    target_label = "quentes (score 70+)"
+                elif pub in ("4", "clientes", "cliente"):
+                    target = "clientes"
+                    target_label = "clientes"
+                else:
+                    target = pub
+                    target_label = pub
+
+                _redis.hset(campaign_key, mapping={"step": "descricao", "target": target, "target_label": target_label})
+                _redis.expire(campaign_key, 600)
                 await whatsapp.send_message(message.phone,
-                    "📢 Use assim:\n\n"
-                    "/campanha [descrição]\n\n"
-                    "Exemplo:\n"
-                    "/campanha lançamento do curso de educação financeira pra filhos, tom urgente mas acolhedor, público: leads mornos pra cima\n\n"
-                    "Filtros opcionais no texto:\n"
-                    "• público: todos | novos | mornos | quentes | clientes\n"
-                    "• score mínimo: ex 'score acima de 30'\n\n"
-                    "A IA personaliza cada mensagem com nome e histórico do lead."
+                    f"👥 Público: *{target_label}*\n\n"
+                    "Agora me diz: sobre o que é a campanha?\n\n"
+                    "Descreva em 1-2 frases (ex: 'lançamento do curso de educação financeira, tom de urgência com exclusividade')"
                 )
-                return {"status": "campaign_help"}
-            try:
-                await whatsapp.send_message(message.phone, "📢 Preparando campanha... vou analisar seus leads e gerar as mensagens personalizadas.")
-                run_campaign.apply_async(args=[owner["id"], campaign_text], queue="learning")
-            except Exception as e:
-                logger.error(f"[Webhook] Erro ao agendar campanha: {e}")
-                await whatsapp.send_message(message.phone, "⚠️ Erro ao iniciar campanha.")
-            return {"status": "campaign_queued"}
+                return {"status": "campaign_step_descricao"}
+
+            # PASSO 2: Descrição
+            if step == "descricao":
+                descricao = msg_raw.strip()
+                target = campaign_state.get("target", "todos")
+                target_label = campaign_state.get("target_label", "todos")
+
+                # Conta leads elegíveis pra dar preview
+                from app.database import get_db
+                db = get_db()
+                query = db.table("customers").select("phone,nurture_paused,total_messages,lead_status,lead_score").eq("owner_id", owner["id"])
+
+                if target == "clientes":
+                    query = query.eq("lead_status", "cliente")
+                elif target == "quentes":
+                    query = query.gte("lead_score", 70)
+                elif target == "mornos+":
+                    query = query.gte("lead_score", 40)
+
+                preview = query.execute()
+                leads_count = len([l for l in (preview.data or []) if not l.get("nurture_paused") and (l.get("total_messages") or 0) > 0])
+
+                _redis.hset(campaign_key, mapping={"step": "confirmar", "descricao": descricao})
+                _redis.expire(campaign_key, 600)
+                await whatsapp.send_message(message.phone,
+                    f"📢 *Confirma a campanha?*\n\n"
+                    f"👥 Público: *{target_label}*\n"
+                    f"📝 Tema: {descricao[:150]}\n"
+                    f"📊 Leads que vão receber: *{leads_count}*\n\n"
+                    f"A IA vai personalizar cada mensagem com nome e histórico do lead.\n\n"
+                    f"Responda *sim* pra disparar ou *não* pra cancelar."
+                )
+                return {"status": "campaign_step_confirmar"}
+
+            # PASSO 3: Confirmação
+            if step == "confirmar":
+                if msg_lower.strip() in ("sim", "s", "yes", "bora", "vai", "manda", "confirmar", "ok"):
+                    target = campaign_state.get("target", "todos")
+                    descricao = campaign_state.get("descricao", "")
+                    target_label = campaign_state.get("target_label", "todos")
+                    _redis.delete(campaign_key)
+
+                    campaign_full = f"{descricao} | público: {target_label}"
+                    await whatsapp.send_message(message.phone,
+                        "🚀 *Campanha iniciada!*\n\n"
+                        "Gerando mensagens personalizadas e disparando...\n"
+                        "Você recebe o relatório quando terminar."
+                    )
+                    run_campaign.apply_async(args=[owner["id"], campaign_full], queue="learning")
+                    return {"status": "campaign_started"}
+                else:
+                    _redis.delete(campaign_key)
+                    await whatsapp.send_message(message.phone, "❌ Campanha cancelada.")
+                    return {"status": "campaign_cancelled"}
 
         # AJUDA: lista todos os comandos disponíveis
         if msg_lower in ("/help", "/ajuda", "/comandos"):
@@ -213,7 +293,7 @@ async def receive_whatsapp(request: Request):
                 "/stats — resumo rápido do dia\n"
                 "/relatorio — relatório semanal completo com IA\n"
                 "/recalcular — recalcula scores de todos os leads\n"
-                "/campanha [texto] — disparo ativo personalizado\n"
+                "/campanha — criar campanha ativa (passo a passo)\n"
                 "/assumir [telefone] — assumir atendimento de um lead\n"
                 "/retomar [telefone] — devolver lead pro bot\n"
                 "/cliente [telefone] — marcar como cliente\n"
