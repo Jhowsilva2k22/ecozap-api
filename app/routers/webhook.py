@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException
 from app.services.whatsapp import WhatsAppService
 from app.services.memory import MemoryService
-from app.queues.tasks import process_message, learn_from_links
+from app.queues.tasks import process_message, process_buffered, learn_from_links, celery_app
 from app.config import get_settings
 import logging
 import re
@@ -16,6 +16,7 @@ memory = MemoryService()
 _settings = get_settings()
 _redis = redis.from_url(_settings.redis_url, decode_responses=True)
 DEDUP_TTL = 120  # segundos — janela de proteção contra duplicatas
+DEBOUNCE_SECONDS = 4  # espera 4s após última mensagem antes de responder
 
 # Prefixos que o DONO usa para ensinar o bot
 LEARN_PREFIXES = ("aprender:", "aprender ", "configurar:", "configurar ", "link:", "base:")
@@ -110,14 +111,41 @@ async def receive_whatsapp(request: Request):
                 logger.info(f"[Webhook] Ignorado — lead {message.phone} em atendimento humano")
                 return {"status": "in_human_handoff"}
 
-    # ── Fluxo normal de atendimento ──────────────────────────────────────────
-    process_message.apply_async(
-        args=[message.phone, owner["id"], message.message, owner.get("agent_mode", "both"),
-              message.message_id, message.media_type or "text"],
-        queue="messages",
-        routing_key=f"phone.{message.phone}"
-    )
-    return {"status": "queued"}
+    # ── Rate limiting: agrupa mensagens rápidas ────────────────────────────
+    buffer_key = f"buffer:{message.phone}:{owner['id']}"
+    task_key = f"buffer_task:{message.phone}:{owner['id']}"
+
+    try:
+        import json as _json
+        # Adiciona mensagem ao buffer (lista no Redis)
+        msg_data = _json.dumps({
+            "text": message.message or "",
+            "message_id": message.message_id or "",
+            "media_type": message.media_type or "text"
+        })
+        _redis.rpush(buffer_key, msg_data)
+        _redis.expire(buffer_key, 30)  # TTL de segurança
+
+        # Revoga task anterior (se existir) e agenda nova com delay
+        old_task_id = _redis.get(task_key)
+        if old_task_id:
+            celery_app.control.revoke(old_task_id, terminate=False)
+
+        result = process_buffered.apply_async(
+            args=[message.phone, owner["id"], owner.get("agent_mode", "both")],
+            countdown=DEBOUNCE_SECONDS,
+            queue="messages"
+        )
+        _redis.setex(task_key, 30, result.id)
+    except Exception as e:
+        logger.warning(f"[Webhook] Buffer falhou, processando direto: {e}")
+        process_message.apply_async(
+            args=[message.phone, owner["id"], message.message, owner.get("agent_mode", "both"),
+                  message.message_id, message.media_type or "text"],
+            queue="messages"
+        )
+
+    return {"status": "buffered"}
 
 
 @router.get("/webhook/health")

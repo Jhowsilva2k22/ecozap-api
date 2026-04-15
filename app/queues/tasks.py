@@ -13,6 +13,7 @@ celery_app.conf.update(
     task_acks_late=True, worker_prefetch_multiplier=1,
     task_routes={
         "app.queues.tasks.process_message": {"queue": "messages"},
+        "app.queues.tasks.process_buffered": {"queue": "messages"},
         "app.queues.tasks.nightly_learning": {"queue": "learning"},
         "app.queues.tasks.nightly_learning_all": {"queue": "learning"},
         "app.queues.tasks.learn_from_links": {"queue": "learning"},
@@ -38,24 +39,72 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
                     message_id: str = "", media_type: str = "text"):
     try:
         kwargs = {"message_id": message_id, "media_type": media_type}
-        if agent_mode == "qualifier":
-            from app.agents.qualifier import QualifierAgent
-            run_async(QualifierAgent().process(phone, owner_id, message, **kwargs))
-        elif agent_mode == "attendant":
-            from app.agents.attendant import AttendantAgent
-            run_async(AttendantAgent().process(phone, owner_id, message, **kwargs))
-        elif agent_mode == "both":
-            from app.services.memory import MemoryService
-            customer = run_async(MemoryService().get_or_create_customer(phone, owner_id))
-            if customer.lead_status in ["cliente"]:
-                from app.agents.attendant import AttendantAgent
-                run_async(AttendantAgent().process(phone, owner_id, message, **kwargs))
-            else:
-                from app.agents.qualifier import QualifierAgent
-                run_async(QualifierAgent().process(phone, owner_id, message, **kwargs))
+        _dispatch_to_agent(phone, owner_id, message, agent_mode, **kwargs)
     except Exception as exc:
         logger.error(f"Erro ao processar mensagem de {phone}: {exc}")
         raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
+def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
+    """Processa mensagens agrupadas do buffer Redis (rate limiting)."""
+    import json as _json
+    import redis
+
+    try:
+        _redis = redis.from_url(settings.redis_url, decode_responses=True)
+        buffer_key = f"buffer:{phone}:{owner_id}"
+        task_key = f"buffer_task:{phone}:{owner_id}"
+
+        # Pega todas as mensagens do buffer
+        raw_msgs = _redis.lrange(buffer_key, 0, -1)
+        _redis.delete(buffer_key)
+        _redis.delete(task_key)
+
+        if not raw_msgs:
+            logger.info(f"[Buffer] Nenhuma mensagem no buffer para {phone}")
+            return
+
+        # Decodifica mensagens
+        msgs = [_json.loads(m) for m in raw_msgs]
+        logger.info(f"[Buffer] Processando {len(msgs)} mensagem(ns) agrupadas de {phone}")
+
+        # Junta textos em uma mensagem só, preserva o media_type da última
+        texts = [m["text"] for m in msgs if m["text"]]
+        combined_text = "\n".join(texts) if texts else ""
+        last_msg = msgs[-1]
+        media_type = last_msg.get("media_type", "text")
+        message_id = last_msg.get("message_id", "")
+
+        if not combined_text:
+            logger.info(f"[Buffer] Mensagens vazias de {phone}, ignorando")
+            return
+
+        kwargs = {"message_id": message_id, "media_type": media_type}
+        _dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs)
+
+    except Exception as exc:
+        logger.error(f"[Buffer] Erro ao processar buffer de {phone}: {exc}")
+        raise self.retry(exc=exc)
+
+
+def _dispatch_to_agent(phone: str, owner_id: str, message: str, agent_mode: str, **kwargs):
+    """Roteia mensagem para o agente correto."""
+    if agent_mode == "qualifier":
+        from app.agents.qualifier import QualifierAgent
+        run_async(QualifierAgent().process(phone, owner_id, message, **kwargs))
+    elif agent_mode == "attendant":
+        from app.agents.attendant import AttendantAgent
+        run_async(AttendantAgent().process(phone, owner_id, message, **kwargs))
+    elif agent_mode == "both":
+        from app.services.memory import MemoryService
+        customer = run_async(MemoryService().get_or_create_customer(phone, owner_id))
+        if customer.lead_status in ["cliente"]:
+            from app.agents.attendant import AttendantAgent
+            run_async(AttendantAgent().process(phone, owner_id, message, **kwargs))
+        else:
+            from app.agents.qualifier import QualifierAgent
+            run_async(QualifierAgent().process(phone, owner_id, message, **kwargs))
 
 @celery_app.task(queue="learning")
 def nightly_learning(owner_id: str):
