@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException
 from app.services.whatsapp import WhatsAppService
 from app.services.memory import MemoryService
-from app.queues.tasks import process_message, process_buffered, learn_from_links, follow_up_active, weekly_report, recalculate_scores, celery_app
+from app.queues.tasks import process_message, process_buffered, learn_from_links, follow_up_active, weekly_report, recalculate_scores, celery_app, _panel_url
 from app.config import get_settings
 import logging
 import re
@@ -28,6 +28,7 @@ CLIENT_PREFIX  = ("/cliente ",)
 STATS_CMDS     = ("/stats", "/status", "/resumo")
 REPORT_CMDS    = ("/relatorio", "/relatório", "/report")
 RECALC_CMDS    = ("/recalcular",)
+PANEL_CMDS     = ("/painel", "/panel", "/dashboard")
 
 @router.post("/webhook/whatsapp")
 async def receive_whatsapp(request: Request):
@@ -172,6 +173,12 @@ async def receive_whatsapp(request: Request):
                 await whatsapp.send_message(message.phone, "⚠️ Erro ao iniciar recálculo.")
             return {"status": "recalc_queued"}
 
+        # PAINEL: envia link direto pro painel autenticado
+        if msg_lower in PANEL_CMDS:
+            panel = _panel_url()
+            await whatsapp.send_message(message.phone, f"📊 Acesse seu painel:\n👉 {panel}")
+            return {"status": "panel_sent"}
+
         # AJUDA: lista todos os comandos disponíveis
         if msg_lower in ("/help", "/ajuda", "/comandos"):
             help_msg = (
@@ -185,6 +192,7 @@ async def receive_whatsapp(request: Request):
                 "/nota [telefone] [texto] — anotar no perfil do lead\n"
                 "/aprender [link] — ensinar o bot com novo conteúdo\n"
                 "/bemvindo [texto] — configurar mensagem de boas-vindas\n"
+                "/painel — abrir painel de gestão\n"
                 "/ajuda — ver esta lista"
             )
             await whatsapp.send_message(message.phone, help_msg)

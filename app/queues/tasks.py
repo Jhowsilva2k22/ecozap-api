@@ -1,10 +1,18 @@
 from celery import Celery
 from app.config import get_settings
+from urllib.parse import quote
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+def _panel_url() -> str:
+    """Gera URL do painel já autenticada com token."""
+    base = settings.app_url.rstrip("/")
+    token = quote(settings.app_secret, safe="")
+    return f"{base}/panel?token={token}"
 
 celery_app = Celery("whatsapp_agent", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
@@ -881,9 +889,12 @@ Foque no que IMPORTA pro dono tomar decisão."""
 
             full_msg = header + analysis
 
+            # Adiciona link do painel
+            full_msg += f"\n\n👉 Ver painel: {_panel_url()}"
+
             # WhatsApp tem limite de ~4096 chars
             if len(full_msg) > 4000:
-                full_msg = full_msg[:3950] + "\n\n_(relatório completo no painel)_"
+                full_msg = full_msg[:3900] + f"\n\n_(relatório completo no painel)_\n👉 {_panel_url()}"
 
             run_async(wa.send_message(owner_phone, full_msg))
             logger.info(f"[WeeklyReport] Enviado para {owner.get('business_name', owner_id)}")
@@ -1003,11 +1014,12 @@ def recalculate_scores(owner_id: str):
 
     # Notifica o dono
     if owner_phone:
+        panel = _panel_url()
         msg = (
             f"✅ *Recálculo completo!*\n\n"
             f"📊 {updated}/{total} leads atualizados\n"
             f"Scores e status recalculados com base no histórico real.\n\n"
-            f"Acesse o painel pra ver os resultados atualizados."
+            f"👉 Ver painel: {panel}"
         )
         run_async(wa.send_message(owner_phone, msg))
 
