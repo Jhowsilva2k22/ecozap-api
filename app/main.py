@@ -28,6 +28,31 @@ app.include_router(panel.router, tags=["Panel"])
 async def root():
     return {"service": "WhatsApp AI Agent", "status": "online", "version": "1.0.0"}
 
+@app.get("/debug/ig-migrate")
+async def ig_migrate():
+    """Temporario: adiciona instagram_account_id na tabela owners e preenche."""
+    import httpx
+    s = get_settings()
+    headers = {
+        "apikey": s.supabase_service_key,
+        "Authorization": f"Bearer {s.supabase_service_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    base = s.supabase_url.rstrip("/")
+    results = []
+    async with httpx.AsyncClient(timeout=15) as c:
+        # 1. Adiciona coluna
+        r1 = await c.post(f"{base}/rest/v1/rpc/exec_sql", headers=headers,
+                          json={"query": "ALTER TABLE owners ADD COLUMN IF NOT EXISTS instagram_account_id TEXT;"})
+        results.append({"add_column": r1.status_code, "body": r1.text[:200]})
+        # 2. Preenche com o ID do Instagram
+        r2 = await c.patch(f"{base}/rest/v1/owners?id=not.is.null",
+                           headers={**headers, "Prefer": "return=minimal"},
+                           json={"instagram_account_id": s.instagram_account_id})
+        results.append({"update_owners": r2.status_code, "body": r2.text[:200]})
+    return {"results": results}
+
 @app.get("/debug/ig-check")
 async def ig_check():
     """Endpoint temporario de diagnostico — REMOVER DEPOIS."""
