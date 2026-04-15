@@ -128,10 +128,13 @@ class AttendantAgent:
                 logger.info(f"[Attendant] Aniversário detectado para {phone}: {detected_bday}")
 
         classification = await self.ai.classify_intent(display_message, context=customer.summary or "")
+        logger.info(f"[Attendant] {phone} classify_intent raw: {classification}")
         is_simple = classification.get("is_simple", False)
         intent = classification.get("intent", "outros")
         score_delta = classification.get("lead_score_delta", 0)
-        new_score = min(100, max(0, (customer.lead_score or 0) + score_delta))
+        old_score = customer.lead_score or 0
+        new_score = min(100, max(0, old_score + score_delta))
+        logger.info(f"[Attendant] {phone} score: {old_score} + {score_delta} = {new_score}")
 
         # ── Progressão automática de status baseada no score ────────────
         new_status = _auto_status(customer.lead_status, new_score)

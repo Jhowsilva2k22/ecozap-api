@@ -75,13 +75,37 @@ class MemoryService:
         result = self.db.table("owners").select("*").eq("id", owner_id).maybe_single().execute()
         return result.data if result and result.data else None
 
+    _GREETINGS = {
+        "oi", "olá", "ola", "hey", "eae", "eai", "e ai", "e aí",
+        "boa noite", "boa tarde", "bom dia", "boa madrugada",
+        "oi boa noite", "oi boa tarde", "oi bom dia",
+        "olá boa noite", "olá boa tarde", "olá bom dia",
+        "ola boa noite", "ola boa tarde", "ola bom dia",
+        "oie", "oii", "oiii", "opa", "fala", "salve",
+        "obrigado", "obrigada", "vlw", "valeu", "brigado", "brigada",
+        "ok", "tá", "ta", "sim", "não", "nao", "beleza", "blz",
+        "tudo bem", "tudo bom", "td bem", "td bom",
+        "bom", "boa", "show", "massa", "top", "legal",
+        "tchau", "até mais", "ate mais", "flw", "falou",
+        "oi tudo bem", "oi tudo bom", "olá tudo bem",
+        "boas", "noite", "tarde", "dia",
+    }
+
     async def detect_and_save_name(self, phone: str, owner_id: str, message: str):
         """Detecta nome do lead em uma mensagem curta (resposta a 'qual seu nome?')."""
         msg = message.strip()
+        # Remove pontuação e emojis pra comparar
+        clean = msg.replace("!", "").replace("?", "").replace(".", "").replace(",", "").strip()
+        clean_lower = clean.lower()
+
+        # Ignora saudações e frases comuns
+        if clean_lower in self._GREETINGS:
+            return None
+
         # Heurística: mensagem curta (1-3 palavras), sem URL, sem número
-        words = msg.split()
-        if 1 <= len(words) <= 3 and not any(c.isdigit() for c in msg) and "http" not in msg:
-            name = msg.title()
+        words = clean.split()
+        if 1 <= len(words) <= 3 and not any(c.isdigit() for c in clean) and "http" not in msg:
+            name = clean.title()
             await self.update_customer(phone, owner_id, {"name": name})
             logger.info(f"[Memory] Nome detectado: {name} ({phone})")
             return name

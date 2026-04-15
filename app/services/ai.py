@@ -58,11 +58,18 @@ Contexto: {context or 'nenhum'}
 Mensagem: {message}
 
 Responda APENAS o JSON."""
-        response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=150, messages=[{"role": "user", "content": prompt}])
         import json
         try:
-            return json.loads(response.content[0].text.strip())
-        except Exception:
+            response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=150, messages=[{"role": "user", "content": prompt}])
+            raw = response.content[0].text.strip()
+            # Remove ```json wrapper se existir
+            if raw.startswith("```"):
+                raw = raw.split("```")[1].replace("json", "").strip()
+            result = json.loads(raw)
+            logger.info(f"[Classify] msg='{message[:40]}' → intent={result.get('intent')} score_delta={result.get('lead_score_delta')} sentiment={result.get('sentiment')}")
+            return result
+        except Exception as e:
+            logger.error(f"[Classify] ERRO ao classificar '{message[:40]}': {e}")
             return {"intent": "outros", "lead_score_delta": 0, "is_simple": False, "urgency": "media", "sentiment": "neutro"}
 
     # ── HELPERS DE MÍDIA ──────────────────────────────────────────────────────
