@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     meta_app_id: str = ""
     meta_app_secret: str = ""
     meta_page_token: str = ""
+    meta_page_id: str = ""
     instagram_account_id: str = ""
     meta_verify_token: str = "ig_verify_joa2024"
     app_secret: str = "secret"

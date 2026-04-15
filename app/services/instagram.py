@@ -13,6 +13,8 @@ class InstagramService:
         self.settings = get_settings()
         self.page_token = self.settings.meta_page_token
         self.ig_account_id = self.settings.instagram_account_id
+        # Para enviar mensagens, a API exige o Facebook Page ID (não o IG Account ID)
+        self.page_id = self.settings.meta_page_id or self.ig_account_id
         self.headers = {
             "Authorization": f"Bearer {self.page_token}",
             "Content-Type": "application/json",
@@ -20,7 +22,7 @@ class InstagramService:
 
     async def send_message(self, recipient_id: str, text: str) -> dict:
         """Envia mensagem de texto via Instagram Messaging API."""
-        url = f"{GRAPH_API}/{self.ig_account_id}/messages"
+        url = f"{GRAPH_API}/{self.page_id}/messages"
         payload = {
             "recipient": {"id": recipient_id},
             "message": {"text": text},
@@ -41,7 +43,7 @@ class InstagramService:
 
     async def send_typing(self, recipient_id: str, duration: int = 3000):
         """Envia indicador de digitando (sender_action)."""
-        url = f"{GRAPH_API}/{self.ig_account_id}/messages"
+        url = f"{GRAPH_API}/{self.page_id}/messages"
         payload = {
             "recipient": {"id": recipient_id},
             "sender_action": "typing_on",
