@@ -100,13 +100,21 @@ async def receive_whatsapp(request: Request):
         if any(msg_lower.startswith(p) for p in WELCOME_PREFIX):
             welcome_text = _extract_after_prefix(msg_raw, WELCOME_PREFIX)
             if welcome_text:
-                memory.db.table("owners").update({"welcome_message": welcome_text}).eq("id", owner["id"]).execute()
-                await whatsapp.send_message(
-                    message.phone,
-                    f"✅ Mensagem de boas-vindas atualizada!\n\n"
-                    f"Preview:\n_{welcome_text}_\n\n"
-                    f"Variáveis disponíveis: {{nome}}, {{negocio}}"
-                )
+                try:
+                    memory.db.table("owners").update({"welcome_message": welcome_text}).eq("id", owner["id"]).execute()
+                    await whatsapp.send_message(
+                        message.phone,
+                        f"✅ Mensagem de boas-vindas atualizada!\n\n"
+                        f"Preview:\n_{welcome_text}_\n\n"
+                        f"Variáveis disponíveis: {{nome}}, {{negocio}}"
+                    )
+                except Exception as e:
+                    logger.error(f"[Webhook] Erro ao salvar welcome: {e}")
+                    await whatsapp.send_message(
+                        message.phone,
+                        "⚠️ Erro ao salvar. Rode no Supabase:\n"
+                        "ALTER TABLE owners ADD COLUMN welcome_message TEXT DEFAULT '';"
+                    )
                 return {"status": "welcome_updated"}
 
     # ── Bloqueia bot se lead está em atendimento humano ──────────────────────

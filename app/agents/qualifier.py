@@ -130,7 +130,7 @@ class QualifierAgent:
 
         # ── Boas-vindas no primeiro contato ─────────────────────────────────
         is_first_contact = (customer.total_messages or 0) == 0
-        welcome_msg = owner.get("welcome_message", "")
+        welcome_msg = (owner.get("welcome_message") or "")
         if is_first_contact and welcome_msg:
             # Substitui variáveis dinâmicas
             final_welcome = welcome_msg.replace("{nome}", customer.name or "")
