@@ -49,17 +49,18 @@ class AIService:
 - lead_score_delta: numero de -10 a +20
 - is_simple: true se for mensagem simples (oi, obrigado, ok)
 - urgency: alta | media | baixa
+- sentiment: positivo | neutro | negativo | frustrado | entusiasmado
 
 Contexto: {context or 'nenhum'}
 Mensagem: {message}
 
 Responda APENAS o JSON."""
-        response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=100, messages=[{"role": "user", "content": prompt}])
+        response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=150, messages=[{"role": "user", "content": prompt}])
         import json
         try:
             return json.loads(response.content[0].text.strip())
         except Exception:
-            return {"intent": "outros", "lead_score_delta": 0, "is_simple": False, "urgency": "media"}
+            return {"intent": "outros", "lead_score_delta": 0, "is_simple": False, "urgency": "media", "sentiment": "neutro"}
 
     # ── HELPERS DE MÍDIA ──────────────────────────────────────────────────────
 

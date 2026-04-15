@@ -24,3 +24,5 @@ class CustomerProfile(BaseModel):
     birthday: Optional[str] = None          # formato "DD/MM" ou "DD/MM/AAAA"
     nurture_paused: bool = False             # True = cliente pediu pra parar msgs
     last_nurture: Optional[datetime] = None  # última msg de nurturing enviada
+    last_sentiment: Optional[str] = None     # positivo|neutro|negativo|frustrado|entusiasmado
+    sentiment_history: Optional[list] = None # últimos sentimentos detectados

@@ -147,7 +147,13 @@ class AttendantAgent:
                 user_message=display_message, use_gemini=is_simple)
 
         await self.memory.save_turn(phone, owner_id, "assistant", response)
-        await self.memory.update_customer(phone, owner_id, {"last_intent": intent, "total_messages": (customer.total_messages or 0) + 1})
+        sentiment = classification.get("sentiment", "neutro")
+        sent_history = list(customer.sentiment_history or [])[-9:]
+        sent_history.append(sentiment)
+        await self.memory.update_customer(phone, owner_id, {
+            "last_intent": intent, "total_messages": (customer.total_messages or 0) + 1,
+            "last_sentiment": sentiment, "sentiment_history": sent_history
+        })
         await self.whatsapp.send_typing(phone, duration=len(response) * 40)
         await self.whatsapp.send_message(phone, response)
         logger.info(f"[Attendant] {phone} | intent={intent} | media={media_type}")

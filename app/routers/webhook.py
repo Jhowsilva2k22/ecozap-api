@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException
 from app.services.whatsapp import WhatsAppService
 from app.services.memory import MemoryService
-from app.queues.tasks import process_message, process_buffered, learn_from_links, follow_up_active, celery_app
+from app.queues.tasks import process_message, process_buffered, learn_from_links, follow_up_active, weekly_report, celery_app
 from app.config import get_settings
 import logging
 import re
@@ -118,7 +118,7 @@ async def receive_whatsapp(request: Request):
                 return {"status": "welcome_updated"}
 
         # STATS: resumo rápido do dia
-        if msg_lower in ("stats", "status", "resumo", "relatorio", "relatório"):
+        if msg_lower in ("stats", "status", "resumo"):
             try:
                 stats_msg = await _build_owner_stats(owner["id"])
                 await whatsapp.send_message(message.phone, stats_msg)
@@ -126,6 +126,16 @@ async def receive_whatsapp(request: Request):
                 logger.error(f"[Webhook] Erro ao gerar stats: {e}")
                 await whatsapp.send_message(message.phone, "⚠️ Erro ao gerar relatório.")
             return {"status": "stats_sent"}
+
+        # RELATÓRIO SEMANAL: análise completa com IA
+        if msg_lower in ("relatorio", "relatório", "relatorio semanal", "relatório semanal", "report"):
+            try:
+                await whatsapp.send_message(message.phone, "📊 Gerando relatório semanal com análise completa... pode levar até 1 minuto.")
+                weekly_report.apply_async(queue="learning")
+            except Exception as e:
+                logger.error(f"[Webhook] Erro ao agendar relatório: {e}")
+                await whatsapp.send_message(message.phone, "⚠️ Erro ao gerar relatório.")
+            return {"status": "report_queued"}
 
     # ── Bloqueia bot se lead está em atendimento humano ──────────────────────
     if sender_phone != owner_phone:

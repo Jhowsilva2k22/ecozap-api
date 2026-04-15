@@ -227,7 +227,15 @@ class QualifierAgent:
                 user_message=display_message, use_gemini=is_simple)
 
         await self.memory.save_turn(phone, owner_id, "assistant", response)
-        await self.memory.update_customer(phone, owner_id, {"lead_score": new_score, "last_intent": intent, "total_messages": (customer.total_messages or 0) + 1})
+        sentiment = classification.get("sentiment", "neutro")
+        # Atualiza histórico de sentimento (últimos 10)
+        sent_history = list(customer.sentiment_history or [])[-9:]
+        sent_history.append(sentiment)
+        await self.memory.update_customer(phone, owner_id, {
+            "lead_score": new_score, "last_intent": intent,
+            "total_messages": (customer.total_messages or 0) + 1,
+            "last_sentiment": sentiment, "sentiment_history": sent_history
+        })
         await self.whatsapp.send_typing(phone, duration=len(response) * 40)
         await self.whatsapp.send_message(phone, response)
         logger.info(f"[Qualifier] {phone} | intent={intent} | score={new_score} | media={media_type}")

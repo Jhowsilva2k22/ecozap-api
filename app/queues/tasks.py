@@ -17,6 +17,7 @@ celery_app.conf.update(
         "app.queues.tasks.follow_up_active": {"queue": "messages"},
         "app.queues.tasks.follow_up_cold_leads": {"queue": "messages"},
         "app.queues.tasks.nurture_customers": {"queue": "messages"},
+        "app.queues.tasks.weekly_report": {"queue": "learning"},
         "app.queues.tasks.nightly_learning": {"queue": "learning"},
         "app.queues.tasks.nightly_learning_all": {"queue": "learning"},
         "app.queues.tasks.learn_from_links": {"queue": "learning"},
@@ -36,6 +37,11 @@ celery_app.conf.update(
             "task": "app.queues.tasks.nurture_customers",
             "schedule": 43200.0,  # checa a cada 12h
             "options": {"queue": "messages"},
+        },
+        "weekly-report": {
+            "task": "app.queues.tasks.weekly_report",
+            "schedule": 604800.0,  # 1x por semana
+            "options": {"queue": "learning"},
         },
     },
 )
@@ -702,3 +708,186 @@ def nurture_customers():
                 logger.error(f"[Nurture] Erro check-in {phone}: {e}")
 
     logger.info(f"[Nurture] Ciclo completo: {total_sent} mensagens enviadas")
+
+
+# ── Relatório semanal inteligente + sugestões ────────────────────────────────
+
+@celery_app.task(queue="learning")
+def weekly_report():
+    """Gera e envia relatório semanal inteligente via WhatsApp pro dono.
+    Inclui: métricas, sentimento, padrões, sugestões de melhoria.
+    Roda via Celery Beat 1x por semana (domingo 20h).
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.database import get_db
+    from app.services.ai import AIService
+    from app.services.whatsapp import WhatsAppService
+
+    db = get_db()
+    ai = AIService()
+    wa = WhatsAppService()
+    now = datetime.now(timezone.utc)
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    owners_result = db.table("owners").select("id,phone,business_name,main_offer,target_audience").execute()
+    if not owners_result.data:
+        return
+
+    for owner in owners_result.data:
+        owner_id = owner["id"]
+        owner_phone = owner.get("phone", "")
+        if not owner_phone:
+            continue
+
+        try:
+            # ── Coleta dados da semana ──────────────────────────────────
+            all_leads = db.table("customers").select(
+                "phone,name,lead_score,lead_status,channel,total_messages,"
+                "last_contact,first_contact,last_intent,last_sentiment,"
+                "sentiment_history,summary"
+            ).eq("owner_id", owner_id).execute()
+
+            leads = all_leads.data or []
+            if not leads:
+                continue
+
+            # Filtra leads ativos na semana
+            week_leads = []
+            for l in leads:
+                lc = l.get("last_contact")
+                if lc and str(lc)[:10] >= week_ago[:10]:
+                    week_leads.append(l)
+
+            # Novos leads (first_contact na semana)
+            new_leads = []
+            for l in leads:
+                fc = l.get("first_contact")
+                if fc and str(fc)[:10] >= week_ago[:10]:
+                    new_leads.append(l)
+
+            total = len(leads)
+            active_week = len(week_leads)
+            new_count = len(new_leads)
+
+            # Status breakdown
+            status_count = {}
+            for l in leads:
+                s = l.get("lead_status", "desconhecido")
+                status_count[s] = status_count.get(s, 0) + 1
+
+            # Canais da semana
+            channels = {}
+            for l in new_leads:
+                c = l.get("channel") or "não identificado"
+                channels[c] = channels.get(c, 0) + 1
+
+            # Intents da semana
+            intents = {}
+            for l in week_leads:
+                i = l.get("last_intent") or "outros"
+                intents[i] = intents.get(i, 0) + 1
+
+            # Sentimento agregado
+            sentiments = {"positivo": 0, "neutro": 0, "negativo": 0, "frustrado": 0, "entusiasmado": 0}
+            for l in week_leads:
+                hist = l.get("sentiment_history") or []
+                for s in hist:
+                    if s in sentiments:
+                        sentiments[s] += 1
+
+            total_sentiments = sum(sentiments.values()) or 1
+            sentiment_pct = {k: round(v / total_sentiments * 100) for k, v in sentiments.items() if v > 0}
+
+            # Top leads
+            hot_leads = sorted(leads, key=lambda x: x.get("lead_score") or 0, reverse=True)[:5]
+
+            # Leads perdidos / objeções
+            objection_leads = [l for l in week_leads if l.get("last_intent") == "objecao"]
+            cancel_leads = [l for l in week_leads if l.get("last_intent") == "cancelamento"]
+
+            # ── Monta dados pra IA analisar ─────────────────────────────
+            data_summary = (
+                f"NEGÓCIO: {owner.get('business_name', '?')} | OFERTA: {owner.get('main_offer', '?')}\n"
+                f"PÚBLICO: {owner.get('target_audience', '?')}\n\n"
+                f"MÉTRICAS DA SEMANA:\n"
+                f"- Total de leads: {total}\n"
+                f"- Ativos esta semana: {active_week}\n"
+                f"- Novos leads: {new_count}\n"
+                f"- Status: {status_count}\n"
+                f"- Canais de origem (novos): {channels}\n"
+                f"- Intents detectados: {intents}\n"
+                f"- Sentimento: {sentiment_pct}\n"
+                f"- Objeções na semana: {len(objection_leads)}\n"
+                f"- Cancelamentos: {len(cancel_leads)}\n\n"
+                f"TOP 5 LEADS:\n"
+            )
+            for i, l in enumerate(hot_leads, 1):
+                data_summary += (
+                    f"{i}. {l.get('name') or l.get('phone', '?')} — "
+                    f"Score: {l.get('lead_score', 0)} | "
+                    f"Status: {l.get('lead_status', '?')} | "
+                    f"Sentimento: {l.get('last_sentiment', '?')} | "
+                    f"Canal: {l.get('channel', '?')}\n"
+                )
+
+            # Resumos dos leads com objeções pra IA entender padrões
+            if objection_leads:
+                data_summary += "\nOBJEÇÕES DETECTADAS:\n"
+                for l in objection_leads[:5]:
+                    data_summary += f"- {l.get('name') or l.get('phone', '?')}: {(l.get('summary') or '')[:150]}\n"
+
+            # ── IA gera relatório e sugestões ───────────────────────────
+            analysis_prompt = f"""Analise os dados abaixo de um negócio no WhatsApp e gere:
+
+1. RELATÓRIO SEMANAL: resumo executivo em 5-8 linhas, destacando o mais relevante
+2. PADRÕES: o que os dados revelam (canais que trazem mais leads, sentimento predominante, onde leads travam)
+3. SUGESTÕES: 3 ações práticas e específicas pra próxima semana (baseadas nos dados reais, não genéricas)
+
+DADOS:
+{data_summary}
+
+FORMATO: texto direto para WhatsApp, sem markdown pesado. Use emojis com moderação.
+Foque no que IMPORTA pro dono tomar decisão."""
+
+            analysis = run_async(ai.respond(
+                system_prompt="Você é um analista de dados especializado em vendas pelo WhatsApp no Brasil. Seja direto, prático e orientado a ação.",
+                history=[],
+                user_message=analysis_prompt,
+                use_gemini=False
+            ))
+
+            if not analysis:
+                continue
+
+            # ── Monta mensagem final ────────────────────────────────────
+            # Métricas rápidas no topo + análise da IA
+            header = (
+                f"📊 *Relatório Semanal*\n"
+                f"_{owner.get('business_name', '')}_\n\n"
+                f"👥 Total: *{total}* leads | 🆕 Novos: *{new_count}*\n"
+                f"💬 Ativos: *{active_week}* | 🔥 Score 70+: *{len([l for l in leads if (l.get('lead_score') or 0) >= 70])}*\n"
+            )
+
+            if sentiment_pct:
+                sent_line = " | ".join(f"{k}: {v}%" for k, v in sorted(sentiment_pct.items(), key=lambda x: x[1], reverse=True))
+                header += f"🎭 Sentimento: {sent_line}\n"
+
+            if channels:
+                ch_line = ", ".join(f"{k} ({v})" for k, v in sorted(channels.items(), key=lambda x: x[1], reverse=True)[:4])
+                header += f"📍 Canais: {ch_line}\n"
+
+            header += "\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            full_msg = header + analysis
+
+            # WhatsApp tem limite de ~4096 chars
+            if len(full_msg) > 4000:
+                full_msg = full_msg[:3950] + "\n\n_(relatório completo no painel)_"
+
+            run_async(wa.send_message(owner_phone, full_msg))
+            logger.info(f"[WeeklyReport] Enviado para {owner.get('business_name', owner_id)}")
+
+        except Exception as e:
+            logger.error(f"[WeeklyReport] Erro owner {owner_id}: {e}")
+
+    logger.info("[WeeklyReport] Ciclo completo")
