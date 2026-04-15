@@ -159,8 +159,56 @@ class AttendantAgent:
                 await self.whatsapp.send_message(notify_phone, alert)
             logger.info(f"[Attendant] VENDA DETECTADA! {phone} virou cliente automaticamente")
 
+        # ── SOS: Escalonamento inteligente ──────────────────────────────
+        needs_human = classification.get("needs_human", False)
+        human_reason = classification.get("human_reason", "")
+        sentiment = classification.get("sentiment", "neutro")
+        sos_sent = False
+
+        if needs_human and customer.lead_status != "em_atendimento_humano":
+            notify_phone = owner.get("notify_phone")
+            if notify_phone:
+                clean_phone = re.sub(r'\D', '', phone)
+                name = customer.name or "Sem nome"
+                urgency = classification.get("urgency", "media")
+                urgency_icon = "🔴" if urgency == "alta" else "🟡"
+
+                sos_alert = (
+                    f"{urgency_icon} *SOS — Atenção necessária!*\n\n"
+                    f"👤 *{name}* | Score: *{new_score}*\n"
+                    f"📱 wa.me/{clean_phone}\n"
+                    f"🎭 Sentimento: *{sentiment}*\n"
+                    f"📌 Motivo: {human_reason}\n\n"
+                )
+                if customer.summary:
+                    sos_alert += f"📝 Contexto: {customer.summary[:200]}\n\n"
+                sos_alert += (
+                    f"👉 Pra assumir, mande:\n"
+                    f"/assumir {phone}"
+                )
+                await self.whatsapp.send_message(notify_phone, sos_alert)
+                sos_sent = True
+                logger.info(f"[SOS] Alerta enviado para dono! {phone} | motivo: {human_reason}")
+
+        # ── Gera resposta ───────────────────────────────────────────────
         await self.memory.save_turn(phone, owner_id, "user", display_message)
-        system_prompt = build_attendant_prompt(owner=owner, customer=customer.model_dump(), history_summary=customer.summary or "")
+
+        # Se SOS foi acionado, injeta instrução de fallback no prompt
+        sos_instruction = ""
+        if sos_sent:
+            sos_instruction = (
+                "\n\n━━ ATENÇÃO: MODO CONTENÇÃO ━━\n"
+                "O dono foi notificado e vai assumir em breve. "
+                "NÃO invente respostas, NÃO prometa nada, NÃO dê informações que você não tem certeza. "
+                "Segure a conversa com naturalidade: reconheça o que o cliente disse, "
+                "valide o sentimento, e diga que vai verificar/confirmar e já retorna. "
+                "Exemplo: 'Entendi perfeitamente. Deixa eu verificar isso com mais cuidado pra te dar a melhor resposta. Já te retorno!'"
+            )
+
+        system_prompt = build_attendant_prompt(
+            owner=owner, customer=customer.model_dump(),
+            history_summary=customer.summary or ""
+        ) + sos_instruction
 
         if media_type == "image" and media_base64:
             response = await self.ai.respond_with_image(
@@ -176,7 +224,6 @@ class AttendantAgent:
                 user_message=display_message, use_gemini=is_simple)
 
         await self.memory.save_turn(phone, owner_id, "assistant", response)
-        sentiment = classification.get("sentiment", "neutro")
         sent_history = list(customer.sentiment_history or [])[-9:]
         sent_history.append(sentiment)
         await self.memory.update_customer(phone, owner_id, {
@@ -186,7 +233,7 @@ class AttendantAgent:
         })
         await self.whatsapp.send_typing(phone, duration=len(response) * 40)
         await self.whatsapp.send_message(phone, response)
-        logger.info(f"[Attendant] {phone} | intent={intent} | score={new_score} | status={new_status} | media={media_type}")
+        logger.info(f"[Attendant] {phone} | intent={intent} | score={new_score} | status={new_status} | sos={sos_sent} | media={media_type}")
 
 
 def _auto_status(current_status: str, score: int) -> str:

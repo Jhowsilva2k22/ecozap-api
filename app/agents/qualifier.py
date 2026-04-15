@@ -219,11 +219,58 @@ class QualifierAgent:
             await self._notify_sale(phone, owner, customer)
             logger.info(f"[Qualifier] VENDA DETECTADA! {phone} virou cliente automaticamente")
 
+        # ── SOS: Escalonamento inteligente ──────────────────────────────
+        needs_human = classification.get("needs_human", False)
+        human_reason = classification.get("human_reason", "")
+        sos_sent = False
+
+        if needs_human and customer.lead_status != "em_atendimento_humano":
+            notify_phone = owner.get("notify_phone")
+            if notify_phone:
+                clean_phone = re.sub(r'\D', '', phone)
+                name = customer.name or "Sem nome"
+                sentiment = classification.get("sentiment", "neutro")
+                urgency = classification.get("urgency", "media")
+                urgency_icon = "🔴" if urgency == "alta" else "🟡"
+
+                sos_alert = (
+                    f"{urgency_icon} *SOS — Atenção necessária!*\n\n"
+                    f"👤 *{name}* | Score: *{new_score}*\n"
+                    f"📱 wa.me/{re.sub(r'\\D', '', phone)}\n"
+                    f"🎭 Sentimento: *{sentiment}*\n"
+                    f"📌 Motivo: {human_reason}\n\n"
+                )
+                if customer.summary:
+                    sos_alert += f"📝 Contexto: {customer.summary[:200]}\n\n"
+                sos_alert += (
+                    f"👉 Pra assumir, mande:\n"
+                    f"/assumir {phone}"
+                )
+                await self.whatsapp.send_message(notify_phone, sos_alert)
+                sos_sent = True
+                logger.info(f"[SOS] Alerta enviado para dono! {phone} | motivo: {human_reason}")
+
         handoff_threshold = owner.get("handoff_threshold", HANDOFF_SCORE)
         if new_score >= handoff_threshold and customer.lead_score < handoff_threshold and new_status != "cliente":
             await self._trigger_handoff(phone, owner, customer, display_message)
         await self.memory.save_turn(phone, owner_id, "user", display_message)
-        system_prompt = build_qualifier_prompt(owner=owner, customer=customer.model_dump(), history_summary=customer.summary or "")
+
+        # Se SOS acionado, injeta instrução de contenção
+        sos_instruction = ""
+        if sos_sent:
+            sos_instruction = (
+                "\n\n━━ ATENÇÃO: MODO CONTENÇÃO ━━\n"
+                "O dono foi notificado e vai assumir em breve. "
+                "NÃO invente respostas, NÃO prometa nada, NÃO dê informações que você não tem certeza. "
+                "Segure a conversa com naturalidade: reconheça o que o cliente disse, "
+                "valide o sentimento, e diga que vai verificar/confirmar e já retorna. "
+                "Exemplo: 'Entendi perfeitamente. Deixa eu verificar isso com mais cuidado pra te dar a melhor resposta. Já te retorno!'"
+            )
+
+        system_prompt = build_qualifier_prompt(
+            owner=owner, customer=customer.model_dump(),
+            history_summary=customer.summary or ""
+        ) + sos_instruction
 
         if media_type == "image" and media_base64:
             response = await self.ai.respond_with_image(
@@ -274,8 +321,8 @@ class QualifierAgent:
             f"💬 Mensagens trocadas: {total}\n"
             f"📝 Histórico: {summary}\n\n"
             f"💬 *Última mensagem:*\n_{message}_\n\n"
-            f"Para assumir o atendimento, responda:\n"
-            f"*assumir {clean_phone}*"
+            f"👉 Pra assumir, mande:\n"
+            f"/assumir {phone}"
         )
         await self.whatsapp.send_message(notify_phone, alert)
 

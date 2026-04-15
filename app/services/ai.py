@@ -53,6 +53,16 @@ class AIService:
 - is_simple: true se for mensagem simples (oi, obrigado, ok)
 - urgency: alta | media | baixa
 - sentiment: positivo | neutro | negativo | frustrado | entusiasmado
+- needs_human: true se a mensagem indica que o bot NÃO consegue resolver sozinho. Exemplos:
+  * Objeção forte ou repetida ("tá caro demais", "não sei se vale a pena", "concorrente faz mais barato")
+  * Reclamação séria ou frustração crescente ("péssimo atendimento", "quero falar com alguém de verdade")
+  * Pergunta técnica muito específica que foge do contexto geral
+  * Lead quente (score alto) pedindo condição especial, desconto ou personalização
+  * Ameaça de cancelamento ou exposição negativa
+  * Pedido explícito de falar com humano ("quero falar com o responsável", "tem alguém aí?")
+  * Assunto sensível (jurídico, financeiro específico, saúde)
+  Se não se encaixa em nenhum desses, needs_human = false
+- human_reason: se needs_human=true, descreva em 1 frase curta o motivo (ex: "objeção de preço repetida", "pediu falar com responsável", "reclamação grave")
 
 Contexto: {context or 'nenhum'}
 Mensagem: {message}
@@ -60,7 +70,7 @@ Mensagem: {message}
 Responda APENAS o JSON."""
         import json
         try:
-            response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=150, messages=[{"role": "user", "content": prompt}])
+            response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=200, messages=[{"role": "user", "content": prompt}])
             raw = response.content[0].text.strip()
             # Remove ```json wrapper se existir
             if raw.startswith("```"):
