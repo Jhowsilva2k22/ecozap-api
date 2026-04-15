@@ -14,6 +14,7 @@ celery_app.conf.update(
     task_routes={
         "app.queues.tasks.process_message": {"queue": "messages"},
         "app.queues.tasks.nightly_learning": {"queue": "learning"},
+        "app.queues.tasks.learn_from_links": {"queue": "learning"},
     }
 )
 
@@ -52,3 +53,59 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
 def nightly_learning(owner_id: str):
     from app.services.learning import LearningService
     run_async(LearningService().run_daily_analysis(owner_id))
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=10, queue="learning")
+def learn_from_links(self, owner_id: str, links: list):
+    """Processa links enviados pelo dono via WhatsApp e atualiza base de conhecimento."""
+    try:
+        from app.services.scraper import ScraperService
+        from app.services.ai import AIService
+        from app.services.memory import MemoryService
+        from app.services.whatsapp import WhatsAppService
+
+        db = MemoryService().db
+        owner = db.table("owners").select("*").eq("id", owner_id).maybe_single().execute()
+        if not owner or not owner.data:
+            logger.error(f"[LearnLinks] owner {owner_id} nao encontrado")
+            return
+
+        owner_data = owner.data
+        existing_links = owner_data.get("links_processed") or []
+        new_links = [l for l in links if l not in existing_links]
+        if not new_links:
+            logger.info(f"[LearnLinks] links já processados: {links}")
+            return
+
+        scraped = run_async(ScraperService().read_links(new_links))
+        if not scraped:
+            logger.warning(f"[LearnLinks] nenhum conteúdo extraído de {new_links}")
+            return
+
+        existing_context = owner_data.get("context_summary") or ""
+        combined = f"[CONTEXTO ATUAL]\n{existing_context}\n\n[NOVO CONTEÚDO]\n{scraped}"
+        analysis = run_async(AIService().analyze_owner_links(combined))
+        if not analysis:
+            return
+
+        all_links = existing_links + new_links
+        db.table("owners").update({**analysis, "links_processed": all_links}).eq("id", owner_id).execute()
+
+        # Notifica o dono via WhatsApp
+        owner_phone = owner_data.get("phone", "")
+        if owner_phone:
+            summary = analysis.get("context_summary", "")[:200]
+            msg = (
+                f"✅ *Base de conhecimento atualizada!*\n\n"
+                f"🔗 {len(new_links)} link(s) processado(s)\n"
+                f"🎯 Oferta detectada: {analysis.get('main_offer', '-')}\n"
+                f"🗣️ Tom: {analysis.get('tone', '-')}\n\n"
+                f"O agente já está usando as novas informações."
+            )
+            run_async(WhatsAppService().send_message(owner_phone, msg))
+
+        logger.info(f"[LearnLinks] owner {owner_id} aprendeu {len(new_links)} links")
+
+    except Exception as exc:
+        logger.error(f"[LearnLinks] erro: {exc}")
+        raise self.retry(exc=exc)

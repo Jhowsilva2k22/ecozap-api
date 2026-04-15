@@ -48,3 +48,42 @@ async def refresh_owner_links(owner_id: str):
     analysis = await ai.analyze_owner_links(scraped_content)
     memory.db.table("owners").update(analysis).eq("id", owner_id).execute()
     return {"status": "updated", "owner_id": owner_id}
+
+
+class AddLinksRequest(BaseModel):
+    links: list
+
+
+@router.post("/onboarding/{owner_id}/add-links")
+async def add_knowledge_links(owner_id: str, data: AddLinksRequest):
+    """Adiciona novos links à base de conhecimento do dono sem apagar o que já existe."""
+    result = memory.db.table("owners").select("*").eq("id", owner_id).maybe_single().execute()
+    if not (result and result.data):
+        raise HTTPException(status_code=404, detail="Dono nao encontrado")
+
+    owner = result.data
+    existing_links = owner.get("links_processed") or []
+    new_links = [l for l in data.links if l not in existing_links]
+    if not new_links:
+        return {"status": "no_new_links", "message": "Todos os links já foram processados antes."}
+
+    scraped_content = await scraper.read_links(new_links)
+    if not scraped_content:
+        raise HTTPException(status_code=400, detail="Nao foi possivel ler os links fornecidos.")
+
+    # Combina contexto existente com novo conteúdo
+    existing_context = owner.get("context_summary") or ""
+    combined_content = f"[CONTEXTO ATUAL]\n{existing_context}\n\n[NOVO CONTEÚDO]\n{scraped_content}"
+    analysis = await ai.analyze_owner_links(combined_content)
+
+    all_links = existing_links + new_links
+    memory.db.table("owners").update({**analysis, "links_processed": all_links}).eq("id", owner_id).execute()
+
+    logger.info(f"[Onboarding] {owner_id} adicionou {len(new_links)} links: {new_links}")
+    return {
+        "status": "updated",
+        "owner_id": owner_id,
+        "new_links_processed": new_links,
+        "total_links": len(all_links),
+        "detected": {"tone": analysis.get("tone"), "main_offer": analysis.get("main_offer")}
+    }
