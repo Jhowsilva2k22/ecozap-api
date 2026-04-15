@@ -18,15 +18,16 @@ _redis = redis.from_url(_settings.redis_url, decode_responses=True)
 DEDUP_TTL = 120  # segundos — janela de proteção contra duplicatas
 DEBOUNCE_SECONDS = 4  # espera 4s após última mensagem antes de responder
 
-# Prefixos que o DONO usa para ensinar o bot
-LEARN_PREFIXES = ("aprender:", "aprender ", "configurar:", "configurar ", "link:", "base:")
-
-# Comandos de controle de handoff
-HANDOFF_ASSUME = ("assumir ", "assumindo ", "vou atender ", "atendendo ")
-HANDOFF_RESUME = ("retomar ", "retomando ", "devolver ", "bot ")
-NOTE_PREFIX    = ("nota ", "anotacao ", "anotação ")
-WELCOME_PREFIX = ("bemvindo:", "bemvindo ", "boas-vindas:", "boas-vindas ", "welcome:")
-CLIENT_PREFIX  = ("cliente ", "fechou ", "comprou ", "converteu ")
+# Comandos do DONO — todos com /prefixo
+LEARN_PREFIXES = ("/aprender ", "/aprender:", "/link ", "/link:", "/base ")
+HANDOFF_ASSUME = ("/assumir ",)
+HANDOFF_RESUME = ("/retomar ", "/devolver ")
+NOTE_PREFIX    = ("/nota ",)
+WELCOME_PREFIX = ("/bemvindo ", "/bemvindo:", "/boasvindas ", "/boasvindas:")
+CLIENT_PREFIX  = ("/cliente ",)
+STATS_CMDS     = ("/stats", "/status", "/resumo")
+REPORT_CMDS    = ("/relatorio", "/relatório", "/report")
+RECALC_CMDS    = ("/recalcular",)
 
 @router.post("/webhook/whatsapp")
 async def receive_whatsapp(request: Request):
@@ -142,7 +143,7 @@ async def receive_whatsapp(request: Request):
                 return {"status": "client_marked"}
 
         # STATS: resumo rápido do dia
-        if msg_lower in ("stats", "status", "resumo"):
+        if msg_lower in STATS_CMDS:
             try:
                 stats_msg = await _build_owner_stats(owner["id"])
                 await whatsapp.send_message(message.phone, stats_msg)
@@ -152,7 +153,7 @@ async def receive_whatsapp(request: Request):
             return {"status": "stats_sent"}
 
         # RELATÓRIO SEMANAL: análise completa com IA
-        if msg_lower in ("relatorio", "relatório", "relatorio semanal", "relatório semanal", "report"):
+        if msg_lower in REPORT_CMDS:
             try:
                 await whatsapp.send_message(message.phone, "📊 Gerando relatório semanal com análise completa... pode levar até 1 minuto.")
                 weekly_report.apply_async(queue="learning")
@@ -162,7 +163,7 @@ async def receive_whatsapp(request: Request):
             return {"status": "report_queued"}
 
         # RECALCULAR: recalcula scores de todos os leads
-        if msg_lower in ("recalcular", "recalcular scores", "recalcular score"):
+        if msg_lower in RECALC_CMDS:
             try:
                 await whatsapp.send_message(message.phone, "🔄 Recalculando scores de todos os leads... pode levar alguns minutos.")
                 recalculate_scores.apply_async(args=[owner["id"]], queue="learning")
@@ -170,6 +171,24 @@ async def receive_whatsapp(request: Request):
                 logger.error(f"[Webhook] Erro ao agendar recálculo: {e}")
                 await whatsapp.send_message(message.phone, "⚠️ Erro ao iniciar recálculo.")
             return {"status": "recalc_queued"}
+
+        # AJUDA: lista todos os comandos disponíveis
+        if msg_lower in ("/help", "/ajuda", "/comandos"):
+            help_msg = (
+                "📋 *Comandos disponíveis:*\n\n"
+                "/stats — resumo rápido do dia\n"
+                "/relatorio — relatório semanal completo com IA\n"
+                "/recalcular — recalcula scores de todos os leads\n"
+                "/assumir [telefone] — assumir atendimento de um lead\n"
+                "/retomar [telefone] — devolver lead pro bot\n"
+                "/cliente [telefone] — marcar como cliente\n"
+                "/nota [telefone] [texto] — anotar no perfil do lead\n"
+                "/aprender [link] — ensinar o bot com novo conteúdo\n"
+                "/bemvindo [texto] — configurar mensagem de boas-vindas\n"
+                "/ajuda — ver esta lista"
+            )
+            await whatsapp.send_message(message.phone, help_msg)
+            return {"status": "help_sent"}
 
     # ── Bloqueia bot se lead está em atendimento humano ──────────────────────
     if sender_phone != owner_phone:
@@ -438,8 +457,8 @@ def _extract_phone(text: str) -> str:
 
 def _extract_note(text: str) -> str:
     """Remove o prefixo e o número, retorna o texto da nota."""
-    # Remove prefixo tipo "nota 5513999... texto aqui"
-    cleaned = re.sub(r'^(nota|anotacao|anotação)\s+', '', text.strip(), flags=re.IGNORECASE)
+    # Remove prefixo tipo "/nota 5513999... texto aqui"
+    cleaned = re.sub(r'^/?(nota|anotacao|anotação)\s+', '', text.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r'^\+?[\d\s\-\(\)]{8,}\s*', '', cleaned).strip()
     return cleaned
 
