@@ -207,6 +207,11 @@ class QualifierAgent:
         score_delta = classification.get("lead_score_delta", 0)
         is_simple = classification.get("is_simple", False)
         new_score = min(100, max(0, (customer.lead_score or 0) + score_delta))
+
+        # ── Progressão automática de status ─────────────────────────────
+        from app.agents.attendant import _auto_status
+        new_status = _auto_status(customer.lead_status, new_score)
+
         handoff_threshold = owner.get("handoff_threshold", HANDOFF_SCORE)
         if new_score >= handoff_threshold and customer.lead_score < handoff_threshold:
             await self._trigger_handoff(phone, owner, customer, display_message)
@@ -232,8 +237,8 @@ class QualifierAgent:
         sent_history = list(customer.sentiment_history or [])[-9:]
         sent_history.append(sentiment)
         await self.memory.update_customer(phone, owner_id, {
-            "lead_score": new_score, "last_intent": intent,
-            "total_messages": (customer.total_messages or 0) + 1,
+            "lead_score": new_score, "lead_status": new_status,
+            "last_intent": intent, "total_messages": (customer.total_messages or 0) + 1,
             "last_sentiment": sentiment, "sentiment_history": sent_history
         })
         await self.whatsapp.send_typing(phone, duration=len(response) * 40)

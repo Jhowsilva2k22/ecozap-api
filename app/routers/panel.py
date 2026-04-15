@@ -58,7 +58,10 @@ async def get_stats(token: str = Query(...), owner_id: str = Query("")):
 
         total = len(leads)
         today_leads = sum(1 for l in leads if (str(l.get("last_contact") or ""))[:10] == today)
-        hot = sum(1 for l in leads if (l.get("lead_score") or 0) >= 70)
+        novos = sum(1 for l in leads if l.get("lead_status") in ("novo", None, ""))
+        qualificando = sum(1 for l in leads if l.get("lead_status") == "qualificando")
+        mornos = sum(1 for l in leads if l.get("lead_status") == "morno")
+        hot = sum(1 for l in leads if l.get("lead_status") == "quente")
         human = sum(1 for l in leads if l.get("lead_status") == "em_atendimento_humano")
         clientes = sum(1 for l in leads if l.get("lead_status") == "cliente")
 
@@ -85,6 +88,9 @@ async def get_stats(token: str = Query(...), owner_id: str = Query("")):
         return {
             "total": total,
             "hoje": today_leads,
+            "novos": novos,
+            "qualificando": qualificando,
+            "mornos": mornos,
             "quentes": hot,
             "em_atendimento": human,
             "clientes": clientes,
@@ -93,7 +99,7 @@ async def get_stats(token: str = Query(...), owner_id: str = Query("")):
         }
     except Exception as e:
         logger.error(f"[Panel Stats] erro: {e}")
-        return {"total": 0, "hoje": 0, "quentes": 0, "em_atendimento": 0, "clientes": 0, "canais": [], "sentimento": {}}
+        return {"total": 0, "hoje": 0, "novos": 0, "qualificando": 0, "mornos": 0, "quentes": 0, "em_atendimento": 0, "clientes": 0, "canais": [], "sentimento": {}}
 
 
 @router.get("/panel/lead/{phone}/messages")
@@ -198,8 +204,10 @@ def _build_html(token: str) -> str:
   .badge {{ display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }}
   .badge.novo {{ background: #1e2a1e; color: #66bb6a; }}
   .badge.qualificando {{ background: #1e2030; color: #7986cb; }}
+  .badge.morno {{ background: #2a2510; color: #ffb74d; }}
+  .badge.quente {{ background: #2a1510; color: #ff6b35; }}
   .badge.em_atendimento_humano {{ background: #1e2a30; color: #4fc3f7; }}
-  .badge.cliente {{ background: #2a1e10; color: #ffb74d; }}
+  .badge.cliente {{ background: #1a2a1a; color: #81c784; }}
   .intent {{ font-size: 11px; color: #666; }}
   .ch {{ font-size: 11px; color: #888; }}
   .sentiment {{ font-size: 11px; font-weight: 600; }}
@@ -255,9 +263,12 @@ def _build_html(token: str) -> str:
 <div class="stats" id="stats-row">
   <div class="stat"><div class="val" id="s-total">—</div><div class="lbl">Total de leads</div></div>
   <div class="stat today"><div class="val" id="s-hoje">—</div><div class="lbl">Contatos hoje</div></div>
-  <div class="stat hot"><div class="val" id="s-hot">—</div><div class="lbl">Leads quentes</div></div>
+  <div class="stat"><div class="val" id="s-novos" style="color:#66bb6a">—</div><div class="lbl">Novos</div></div>
+  <div class="stat"><div class="val" id="s-qualificando" style="color:#7986cb">—</div><div class="lbl">Qualificando</div></div>
+  <div class="stat"><div class="val" id="s-mornos" style="color:#ffb74d">—</div><div class="lbl">Mornos</div></div>
+  <div class="stat hot"><div class="val" id="s-hot">—</div><div class="lbl">Quentes</div></div>
   <div class="stat human"><div class="val" id="s-human">—</div><div class="lbl">Em atendimento</div></div>
-  <div class="stat" style="border-left: 3px solid #ffb74d"><div class="val" id="s-clientes" style="color:#ffb74d">—</div><div class="lbl">Clientes</div></div>
+  <div class="stat"><div class="val" id="s-clientes" style="color:#81c784">—</div><div class="lbl">Clientes</div></div>
 </div>
 
 <div class="channels" id="channels-row"></div>
@@ -269,6 +280,8 @@ def _build_html(token: str) -> str:
     <option value="">Todos os status</option>
     <option value="novo">Novo</option>
     <option value="qualificando">Qualificando</option>
+    <option value="morno">Morno</option>
+    <option value="quente">Quente</option>
     <option value="em_atendimento_humano">Em atendimento</option>
     <option value="cliente">Cliente</option>
   </select>
@@ -334,7 +347,10 @@ async function loadStats() {{
   const d = await r.json();
   document.getElementById('s-total').textContent = d.total;
   document.getElementById('s-hoje').textContent = d.hoje;
-  document.getElementById('s-hot').textContent = d.quentes;
+  document.getElementById('s-novos').textContent = d.novos || 0;
+  document.getElementById('s-qualificando').textContent = d.qualificando || 0;
+  document.getElementById('s-mornos').textContent = d.mornos || 0;
+  document.getElementById('s-hot').textContent = d.quentes || 0;
   document.getElementById('s-human').textContent = d.em_atendimento;
   document.getElementById('s-clientes').textContent = d.clientes || 0;
   const ch = document.getElementById('channels-row');

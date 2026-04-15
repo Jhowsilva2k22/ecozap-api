@@ -130,6 +130,12 @@ class AttendantAgent:
         classification = await self.ai.classify_intent(display_message, context=customer.summary or "")
         is_simple = classification.get("is_simple", False)
         intent = classification.get("intent", "outros")
+        score_delta = classification.get("lead_score_delta", 0)
+        new_score = min(100, max(0, (customer.lead_score or 0) + score_delta))
+
+        # ── Progressão automática de status baseada no score ────────────
+        new_status = _auto_status(customer.lead_status, new_score)
+
         await self.memory.save_turn(phone, owner_id, "user", display_message)
         system_prompt = build_attendant_prompt(owner=owner, customer=customer.model_dump(), history_summary=customer.summary or "")
 
@@ -151,12 +157,28 @@ class AttendantAgent:
         sent_history = list(customer.sentiment_history or [])[-9:]
         sent_history.append(sentiment)
         await self.memory.update_customer(phone, owner_id, {
+            "lead_score": new_score, "lead_status": new_status,
             "last_intent": intent, "total_messages": (customer.total_messages or 0) + 1,
             "last_sentiment": sentiment, "sentiment_history": sent_history
         })
         await self.whatsapp.send_typing(phone, duration=len(response) * 40)
         await self.whatsapp.send_message(phone, response)
-        logger.info(f"[Attendant] {phone} | intent={intent} | media={media_type}")
+        logger.info(f"[Attendant] {phone} | intent={intent} | score={new_score} | status={new_status} | media={media_type}")
+
+
+def _auto_status(current_status: str, score: int) -> str:
+    """Progressão automática de status baseada no score.
+    Nunca regride: cliente > quente > morno > qualificando > novo.
+    Status 'em_atendimento_humano' e 'perdido' são manuais, não muda."""
+    if current_status in ("em_atendimento_humano", "perdido", "cliente"):
+        return current_status
+    if score >= 70:
+        return "quente"
+    if score >= 40:
+        return "morno"
+    if score >= 15:
+        return "qualificando"
+    return current_status  # mantém "novo" se score ainda baixo
 
 
 # ── Helpers de detecção ──────────────────────────────────────────────────────
