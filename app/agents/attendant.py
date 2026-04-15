@@ -182,11 +182,10 @@ class AttendantAgent:
                 )
                 if customer.summary:
                     sos_alert += f"📝 Contexto: {customer.summary[:200]}\n\n"
-                sos_alert += (
-                    f"👉 Copie e envie pra assumir:\n\n"
-                    f"```/assumir {phone}```"
-                )
+                sos_alert += "👉 Copie a próxima mensagem e envie pra assumir:"
                 await self.whatsapp.send_message(notify_phone, sos_alert)
+                # Mensagem separada SÓ com o comando — long press = copia tudo
+                await self.whatsapp.send_message(notify_phone, f"/assumir {phone}")
                 sos_sent = True
                 logger.info(f"[SOS] Alerta enviado para dono! {phone} | motivo: {human_reason}")
 

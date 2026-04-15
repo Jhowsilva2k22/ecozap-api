@@ -242,11 +242,9 @@ class QualifierAgent:
                 )
                 if customer.summary:
                     sos_alert += f"📝 Contexto: {customer.summary[:200]}\n\n"
-                sos_alert += (
-                    f"👉 Copie e envie pra assumir:\n\n"
-                    f"```/assumir {phone}```"
-                )
+                sos_alert += "👉 Copie a próxima mensagem e envie pra assumir:"
                 await self.whatsapp.send_message(notify_phone, sos_alert)
+                await self.whatsapp.send_message(notify_phone, f"/assumir {phone}")
                 sos_sent = True
                 logger.info(f"[SOS] Alerta enviado para dono! {phone} | motivo: {human_reason}")
 
@@ -321,10 +319,10 @@ class QualifierAgent:
             f"💬 Mensagens trocadas: {total}\n"
             f"📝 Histórico: {summary}\n\n"
             f"💬 *Última mensagem:*\n_{message}_\n\n"
-            f"👉 Copie e envie pra assumir:\n\n"
-            f"```/assumir {phone}```"
+            f"👉 Copie a próxima mensagem e envie pra assumir:"
         )
         await self.whatsapp.send_message(notify_phone, alert)
+        await self.whatsapp.send_message(notify_phone, f"/assumir {phone}")
 
     async def _notify_sale(self, phone: str, owner: dict, customer):
         """Notifica o dono quando uma venda é detectada automaticamente."""
