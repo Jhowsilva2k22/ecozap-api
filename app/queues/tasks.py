@@ -76,6 +76,7 @@ celery_app.conf.update(
         "app.queues.tasks.nightly_learning_all": {"queue": "learning"},
         "app.queues.tasks.learn_from_links": {"queue": "learning"},
         "app.queues.tasks.run_campaign": {"queue": "learning"},
+        "app.queues.tasks.daily_backup": {"queue": "learning"},
     },
     beat_schedule={
         "nightly-learning-all": {
@@ -96,6 +97,11 @@ celery_app.conf.update(
         "weekly-report": {
             "task": "app.queues.tasks.weekly_report",
             "schedule": 604800.0,  # 1x por semana
+            "options": {"queue": "learning"},
+        },
+        "daily-backup": {
+            "task": "app.queues.tasks.daily_backup",
+            "schedule": 86400.0,  # 1x por dia
             "options": {"queue": "learning"},
         },
     },
@@ -1244,3 +1250,20 @@ Responda APENAS a mensagem, nada mais."""
         run_async(wa.send_message(owner_phone, report))
 
     logger.info(f"[Campaign] Concluída: {sent}/{total} enviadas, {errors} erros")
+
+
+# ═══════════════════════════════ BACKUP DIÁRIO ═══════════════════════════
+
+@celery_app.task(queue="learning")
+@with_ops_alert("daily_backup")
+def daily_backup():
+    """Exporta todas as tabelas como JSON → Supabase Storage. Mantém 7 dias."""
+    from app.services.backup import run_backup
+    result = run_backup()
+    logger.info(
+        "[Backup] %s — %d tabelas, %d registros → %s",
+        "OK" if result["ok"] else "FALHA",
+        result["tables"],
+        result["total_rows"],
+        result["file"],
+    )

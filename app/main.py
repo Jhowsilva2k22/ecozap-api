@@ -149,6 +149,38 @@ async def _debug_raise(token: str = ""):
     raise RuntimeError("teste ops — se caiu no Telegram e no Sentry, alerta OK")
 
 
+# ---------------------------------------------------------------------------
+# Admin — backup manual e restore (protegido por token)
+# ---------------------------------------------------------------------------
+@app.get("/admin/backup")
+async def _admin_backup(token: str = ""):
+    if token != settings.app_secret:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token inválido")
+    from app.services.backup import run_backup
+    return run_backup()
+
+
+@app.get("/admin/backups")
+async def _admin_list_backups(token: str = ""):
+    if token != settings.app_secret:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token inválido")
+    from app.services.backup import list_backups
+    return {"backups": list_backups()}
+
+
+@app.get("/admin/restore")
+async def _admin_restore(token: str = "", folder: str = "", dry_run: bool = True):
+    if token != settings.app_secret:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token inválido")
+    if not folder:
+        raise HTTPException(status_code=400, detail="Param 'folder' obrigatório")
+    from app.services.backup import run_restore
+    return run_restore(folder, dry_run=dry_run)
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy_policy():
     return """<!DOCTYPE html>
