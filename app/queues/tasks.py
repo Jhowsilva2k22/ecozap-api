@@ -31,19 +31,48 @@ if SENTRY_DSN:
 
 
 # ---------------------------------------------------------------------------
-# Decorator de alerta ops (Telegram + Sentry capture pela CeleryIntegration)
+# Decorator de alerta ops — agora com tracking, circuit breaker e auto-fix
 # ---------------------------------------------------------------------------
 from app.services.alerts import notify_error  # noqa: E402
 
 
 def with_ops_alert(context_name: str):
-    """Em erro: avisa Telegram + re-levanta pra Celery fazer retry."""
+    """Decorator que:
+    1. Checa circuit breaker antes de executar
+    2. Rastreia sucesso/erro em Redis
+    3. Abre circuit breaker após 5 erros consecutivos
+    4. Tenta auto-fix para padrões conhecidos
+    5. Alerta via Telegram
+    """
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # ── Circuit breaker check ──
             try:
-                return fn(*args, **kwargs)
+                from app.services.ops import is_circuit_open
+                if is_circuit_open(context_name):
+                    logger.warning("[Ops] Circuit aberto para %s — pulando execução", context_name)
+                    return None
+            except Exception:
+                pass  # se ops falhar, roda a task normalmente
+
+            # ── Execução ──
+            try:
+                result = fn(*args, **kwargs)
+                # Sucesso → reseta contador de erros
+                try:
+                    from app.services.ops import track_success
+                    track_success(context_name)
+                except Exception:
+                    pass
+                return result
             except Exception as e:
+                # Erro → rastreia + alerta + re-raise pro Celery retry
+                try:
+                    from app.services.ops import track_error
+                    track_error(context_name, e)
+                except Exception:
+                    pass
                 try:
                     notify_error(f"celery.{context_name}", e)
                 except Exception:
@@ -77,6 +106,8 @@ celery_app.conf.update(
         "app.queues.tasks.learn_from_links": {"queue": "learning"},
         "app.queues.tasks.run_campaign": {"queue": "learning"},
         "app.queues.tasks.daily_backup": {"queue": "learning"},
+        "app.queues.tasks.health_check": {"queue": "learning"},
+        "app.queues.tasks.daily_ops_report": {"queue": "learning"},
     },
     beat_schedule={
         "nightly-learning-all": {
@@ -86,22 +117,33 @@ celery_app.conf.update(
         },
         "follow-up-cold-leads": {
             "task": "app.queues.tasks.follow_up_cold_leads",
-            "schedule": 3600.0,  # checa a cada 1h
+            "schedule": 3600.0,
             "options": {"queue": "messages"},
         },
         "nurture-customers": {
             "task": "app.queues.tasks.nurture_customers",
-            "schedule": 43200.0,  # checa a cada 12h
+            "schedule": 43200.0,
             "options": {"queue": "messages"},
         },
         "weekly-report": {
             "task": "app.queues.tasks.weekly_report",
-            "schedule": 604800.0,  # 1x por semana
+            "schedule": 604800.0,
             "options": {"queue": "learning"},
         },
         "daily-backup": {
             "task": "app.queues.tasks.daily_backup",
-            "schedule": 21600.0,  # 4x por dia (a cada 6h)
+            "schedule": 21600.0,
+            "options": {"queue": "learning"},
+        },
+        # ── OPS: monitoramento autônomo ──
+        "health-check": {
+            "task": "app.queues.tasks.health_check",
+            "schedule": 1800.0,  # a cada 30 min
+            "options": {"queue": "learning"},
+        },
+        "daily-ops-report": {
+            "task": "app.queues.tasks.daily_ops_report",
+            "schedule": 21600.0,  # a cada 6h
             "options": {"queue": "learning"},
         },
     },
@@ -113,6 +155,11 @@ def run_async(coro):
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TASKS DE MENSAGEM
+# ═══════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 @with_ops_alert("process_message")
@@ -129,8 +176,7 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 @with_ops_alert("process_buffered")
 def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
-    """Processa mensagens agrupadas do buffer Redis (rate limiting).
-    Mídias são pré-analisadas e tudo vira uma mensagem unificada pro agente."""
+    """Processa mensagens agrupadas do buffer Redis (rate limiting)."""
     import json as _json
     import redis
 
@@ -150,12 +196,10 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
         msgs = [_json.loads(m) for m in raw_msgs]
         logger.info(f"[Buffer] Processando {len(msgs)} mensagem(ns) agrupadas de {phone}")
 
-        # Separa mídias e textos
         media_msgs = [m for m in msgs if m.get("media_type", "text") != "text" and m.get("message_id")]
         text_parts = [m["text"] for m in msgs if m.get("text")]
 
         if not media_msgs:
-            # Só textos — junta tudo e processa como antes
             combined_text = "\n".join(text_parts) if text_parts else ""
             if not combined_text:
                 logger.info(f"[Buffer] Mensagens vazias de {phone}, ignorando")
@@ -164,7 +208,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
             _dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs)
             return
 
-        # Se tem 1 mídia só, processa normal (agente lida com ela direto)
         if len(media_msgs) == 1 and len(text_parts) <= 1:
             m = media_msgs[0]
             msg_text = text_parts[0] if text_parts else (m.get("text") or "")
@@ -172,7 +215,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
             _dispatch_to_agent(phone, owner_id, msg_text, agent_mode, **kwargs)
             return
 
-        # Múltiplas mídias: pré-analisa cada uma e manda tudo junto como texto
         from app.services.whatsapp import WhatsAppService
         from app.services.ai import AIService
         wa = WhatsAppService()
@@ -198,7 +240,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                     text = run_async(ai.transcribe_audio(b64))
                     descriptions.append(f"[Áudio {i}]: {text}" if text else f"[Áudio {i}: não transcrito]")
                 elif mtype == "document":
-                    # Tenta descrever o documento (nome, tipo, etc.)
                     descriptions.append(f"[Documento {i}]: {media.get('text', 'documento anexado')}")
                 else:
                     descriptions.append(f"[Mídia {i} ({mtype})]: anexada")
@@ -206,17 +247,15 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                 logger.error(f"[Buffer] Erro ao pré-analisar mídia {i} de {phone}: {e}")
                 descriptions.append(f"[Mídia {i}: erro ao processar]")
 
-        # Junta textos + descrições de mídias
         combined_text = "\n".join(text_parts + descriptions) if (text_parts or descriptions) else ""
         if not combined_text:
             logger.info(f"[Buffer] Sem conteúdo processável de {phone}")
             return
 
-        # Manda com o message_id do último meio (ou da última mensagem)
         last_msg = msgs[-1]
         kwargs = {
             "message_id": last_msg.get("message_id", ""),
-            "media_type": "text"  # pq juntamos tudo em texto
+            "media_type": "text"
         }
         _dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs)
 
@@ -236,7 +275,6 @@ def follow_up_active(self, phone: str, owner_id: str):
         contact_svc = ContactService()
         wa_svc = WhatsAppService()
 
-        # Busca contatos com status "active" (que interagiram hoje)
         active_contacts = contact_svc.find_active_today(owner_id)
         if not active_contacts:
             logger.info(f"[Follow-up Active] Nenhum contato ativo hoje para {owner_id}")
@@ -258,16 +296,20 @@ def follow_up_active(self, phone: str, owner_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 @with_ops_alert("follow_up_cold_leads")
 def follow_up_cold_leads(self):
-    """Envia follow-up para leads frios de TODOS os owners (chamado pelo beat sem args)."""
+    """Follow-up de leads frios — itera todos os owners (beat sem args)."""
     try:
         from app.database import get_db
         from app.services.whatsapp import WhatsAppService
+        from app.services.ops import save_progress, get_progress, clear_progress
         from datetime import datetime, timedelta
 
         db = get_db()
         wa_svc = WhatsAppService()
 
-        # Busca todos os owners ativos
+        # Retomada: checa se tem progresso salvo
+        progress = get_progress("follow_up_cold_leads")
+        processed_owners = set(progress.get("done", [])) if progress else set()
+
         owners_resp = db.table("owners").select("id, whatsapp_phone_number_id").execute()
         owners = owners_resp.data or []
 
@@ -279,12 +321,14 @@ def follow_up_cold_leads(self):
 
         for owner in owners:
             owner_id = owner["id"]
+            if owner_id in processed_owners:
+                continue
+
             phone = owner.get("whatsapp_phone_number_id", "")
             if not phone:
                 continue
 
             try:
-                # Busca leads frios (última interação > 7 dias, lead_score != 'client')
                 resp = db.table("customers").select("phone, name, first_name").eq(
                     "owner_id", owner_id
                 ).lt(
@@ -295,6 +339,8 @@ def follow_up_cold_leads(self):
 
                 cold_leads = resp.data or []
                 if not cold_leads:
+                    processed_owners.add(owner_id)
+                    save_progress("follow_up_cold_leads", {"done": list(processed_owners)})
                     continue
 
                 logger.info(f"[Follow-up Cold] {len(cold_leads)} leads frios para owner {owner_id}")
@@ -304,12 +350,16 @@ def follow_up_cold_leads(self):
                         name = lead.get("first_name") or lead.get("name") or "você"
                         msg = f"Oi {name}! Faz um tempo que não conversamos. Posso te ajudar com algo? 😊"
                         run_async(wa_svc.send_message(phone, lead["phone"], msg))
-                        logger.info(f"[Follow-up Cold] Enviado para {lead['phone']}")
                     except Exception as e:
                         logger.error(f"[Follow-up Cold] Erro ao enviar para {lead.get('phone')}: {e}")
 
+                processed_owners.add(owner_id)
+                save_progress("follow_up_cold_leads", {"done": list(processed_owners)})
+
             except Exception as e:
                 logger.error(f"[Follow-up Cold] Erro ao processar owner {owner_id}: {e}")
+
+        clear_progress("follow_up_cold_leads")
 
     except Exception as exc:
         logger.error(f"Erro no follow-up de leads frios: {exc}")
@@ -319,15 +369,18 @@ def follow_up_cold_leads(self):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 @with_ops_alert("nurture_customers")
 def nurture_customers(self):
-    """Envia nurture messages para clientes de TODOS os owners (chamado pelo beat sem args)."""
+    """Nurture de clientes — itera todos os owners (beat sem args)."""
     try:
         from app.database import get_db
         from app.services.whatsapp import WhatsAppService
+        from app.services.ops import save_progress, get_progress, clear_progress
 
         db = get_db()
         wa_svc = WhatsAppService()
 
-        # Busca todos os owners ativos
+        progress = get_progress("nurture_customers")
+        processed_owners = set(progress.get("done", [])) if progress else set()
+
         owners_resp = db.table("owners").select("id, whatsapp_phone_number_id").execute()
         owners = owners_resp.data or []
 
@@ -337,12 +390,14 @@ def nurture_customers(self):
 
         for owner in owners:
             owner_id = owner["id"]
+            if owner_id in processed_owners:
+                continue
+
             phone = owner.get("whatsapp_phone_number_id", "")
             if not phone:
                 continue
 
             try:
-                # Busca clientes (lead_score = 'client')
                 resp = db.table("customers").select("phone, name, first_name").eq(
                     "owner_id", owner_id
                 ).eq(
@@ -351,6 +406,8 @@ def nurture_customers(self):
 
                 customers = resp.data or []
                 if not customers:
+                    processed_owners.add(owner_id)
+                    save_progress("nurture_customers", {"done": list(processed_owners)})
                     continue
 
                 logger.info(f"[Nurture] {len(customers)} clientes para owner {owner_id}")
@@ -360,22 +417,29 @@ def nurture_customers(self):
                         name = customer.get("first_name") or customer.get("name") or "você"
                         msg = f"Olá {name}! Obrigado por ser cliente! Quer conhecer nossas novidades? ✨"
                         run_async(wa_svc.send_message(phone, customer["phone"], msg))
-                        logger.info(f"[Nurture] Enviado para {customer['phone']}")
                     except Exception as e:
                         logger.error(f"[Nurture] Erro ao enviar para {customer.get('phone')}: {e}")
 
+                processed_owners.add(owner_id)
+                save_progress("nurture_customers", {"done": list(processed_owners)})
+
             except Exception as e:
                 logger.error(f"[Nurture] Erro ao processar owner {owner_id}: {e}")
+
+        clear_progress("nurture_customers")
 
     except Exception as exc:
         logger.error(f"Erro no nurture de clientes: {exc}")
         raise self.retry(exc=exc)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  TASKS DE LEARNING
+# ═══════════════════════════════════════════════════════════════════════════
+
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("weekly_report")
 def weekly_report(self, owner_id: str):
-    """Gera e envia relatório semanal (estatísticas, insights, etc.)."""
     try:
         from app.services.report import ReportService
         from app.services.alerts import notify_user
@@ -387,7 +451,6 @@ def weekly_report(self, owner_id: str):
             logger.warning(f"[Weekly Report] Nenhum dado para relatório de {owner_id}")
             return
 
-        # Envia via Telegram ou email
         notify_user(
             owner_id=owner_id,
             title="Relatório Semanal",
@@ -404,7 +467,6 @@ def weekly_report(self, owner_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("recalculate_scores")
 def recalculate_scores(self, owner_id: str):
-    """Recalcula scores (relevância, engagement, etc.) dos contatos."""
     try:
         from app.services.scoring import ScoringService
         scoring_svc = ScoringService()
@@ -419,11 +481,9 @@ def recalculate_scores(self, owner_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("nightly_learning")
 def nightly_learning(self, owner_id: str):
-    """Faz aprendizado noturno de um workspace específico."""
     try:
         from app.services.learning import LearningService
         learning_svc = LearningService()
-        # Processa este workspace
         updated = learning_svc.learn_from_conversations(owner_id)
         logger.info(f"[Nightly Learning] Aprendeu de {updated} conversas de {owner_id}")
 
@@ -435,23 +495,37 @@ def nightly_learning(self, owner_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("nightly_learning_all")
 def nightly_learning_all(self):
-    """Faz aprendizado noturno para TODOS os workspaces em paralelo."""
+    """Aprendizado noturno para TODOS os workspaces. Salva progresso."""
     try:
-        from app.services.workspace import WorkspaceService
-        from app.services.learning import LearningService
+        from app.services.ops import save_progress, get_progress, clear_progress
 
-        ws_svc = WorkspaceService()
+        progress = get_progress("nightly_learning_all")
+        done_ids = set(progress.get("done", [])) if progress else set()
+
+        # Busca todos os owners do Supabase
+        from app.database import get_db
+        db = get_db()
+        resp = db.table("owners").select("id").execute()
+        all_owners = [row["id"] for row in (resp.data or [])]
+
+        from app.services.learning import LearningService
         learning_svc = LearningService()
 
-        workspaces = ws_svc.list_all()
-        logger.info(f"[Nightly Learning All] Processando {len(workspaces)} workspace(s)")
+        logger.info(f"[Nightly Learning All] Processando {len(all_owners)} owner(s), {len(done_ids)} já feitos")
 
-        for ws in workspaces:
+        for oid in all_owners:
+            if oid in done_ids:
+                continue
             try:
-                updated = learning_svc.learn_from_conversations(ws.owner_id)
-                logger.info(f"[Nightly Learning All] {ws.owner_id}: aprendeu de {updated} conversas")
+                updated = learning_svc.learn_from_conversations(oid)
+                logger.info(f"[Nightly Learning All] {oid}: aprendeu de {updated} conversas")
             except Exception as e:
-                logger.error(f"[Nightly Learning All] Erro em {ws.owner_id}: {e}")
+                logger.error(f"[Nightly Learning All] Erro em {oid}: {e}")
+
+            done_ids.add(oid)
+            save_progress("nightly_learning_all", {"done": list(done_ids)})
+
+        clear_progress("nightly_learning_all")
 
     except Exception as exc:
         logger.error(f"Erro no nightly learning all: {exc}")
@@ -461,7 +535,6 @@ def nightly_learning_all(self):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("learn_from_links")
 def learn_from_links(self, owner_id: str):
-    """Aprende de links compartilhados em conversas (web scraping + análise)."""
     try:
         from app.services.link_learning import LinkLearningService
         link_svc = LinkLearningService()
@@ -476,7 +549,6 @@ def learn_from_links(self, owner_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("run_campaign")
 def run_campaign(self, campaign_id: str):
-    """Executa uma campanha (lida + envia mensagens)."""
     try:
         from app.services.campaign import CampaignService
         campaign_svc = CampaignService()
@@ -491,24 +563,75 @@ def run_campaign(self, campaign_id: str):
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="learning")
 @with_ops_alert("daily_backup")
 def daily_backup(self):
-    """Realiza backup diário dos dados via Supabase Storage."""
+    """Backup diário via Supabase Storage."""
     try:
         from app.services.backup import run_backup
         result = run_backup()
-        logger.info(f"[Daily Backup] Backup realizado com sucesso — {result.get('total_rows', 0)} registros")
+        logger.info(f"[Daily Backup] OK — {result.get('total_rows', 0)} registros")
 
     except Exception as exc:
         logger.error(f"Erro ao fazer backup: {exc}")
         raise self.retry(exc=exc)
 
 
-# ---------------------------------------------------------------------------
-# Funcs auxiliares (não são tasks, são funcs chamadas pelas tasks)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  TASKS DE OPS (monitoramento autônomo)
+# ═══════════════════════════════════════════════════════════════════════════
 
+@celery_app.task(bind=True, max_retries=1, default_retry_delay=30, queue="learning")
+def health_check(self):
+    """Roda a cada 30 min. Verifica componentes e alerta se algo está degradado."""
+    try:
+        from app.services.ops import run_health_check
+        from app.services.alerts import notify_warn
+
+        report = run_health_check()
+
+        if report["overall"] != "healthy":
+            # Monta resumo dos problemas
+            problems = []
+            for comp, info in report.get("components", {}).items():
+                if info["status"] != "ok":
+                    problems.append(f"`{comp}`: {info['status']}")
+            for task, info in report.get("circuits", {}).items():
+                ttl = info.get("ttl_seconds", 0)
+                problems.append(f"Circuit `{task}` aberto ({ttl // 60}min restantes)")
+
+            if problems:
+                notify_warn(
+                    f"Health Check — DEGRADADO\n\n"
+                    + "\n".join(problems)
+                )
+
+        logger.info(f"[Health Check] Status: {report['overall']}")
+
+    except Exception as exc:
+        logger.error(f"Erro no health check: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=1, default_retry_delay=30, queue="learning")
+def daily_ops_report(self):
+    """Relatório de ops a cada 6h no Telegram."""
+    try:
+        from app.services.ops import generate_ops_report
+        from app.services.alerts import notify_owner
+
+        report = generate_ops_report()
+        notify_owner(report, level="info")
+        logger.info("[Ops Report] Enviado")
+
+    except Exception as exc:
+        logger.error(f"Erro ao gerar ops report: {exc}")
+        raise self.retry(exc=exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FUNCS AUXILIARES
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def _dispatch_to_agent(phone: str, owner_id: str, message: str, agent_mode: str, **kwargs):
-    """Despacha a mensagem para o agente (determinístico baseado no modo)."""
+    """Despacha a mensagem para o agente."""
     from app.services.agent import AgentService
 
     agent = AgentService(owner_id)
