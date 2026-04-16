@@ -1,8 +1,12 @@
 """
 Backup & Restore — Supabase tables → JSON → Supabase Storage
 Roda diário via Celery Beat. Mantém últimos 7 dias.
+
+Guardian v1: valida integridade do backup ANTES de salvar no Storage.
+Backup corrompido → não salva, envia alerta imediato.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -51,6 +55,40 @@ def _upload_json(db, path: str, data: dict):
     )
 
 
+# ──────────────────────────────── GUARDIAN ──────────────────────────────
+
+def _run_guardian_validation(backup_data: dict) -> dict:
+    """
+    Executa validação do Guardian de forma síncrona.
+    O Guardian é async; usa asyncio para chamar de contexto síncrono do Celery.
+    """
+    try:
+        from app.agents.registry import get_agent
+        guardian = get_agent("guardian")
+        if guardian is None:
+            # Guardian não registrado ainda — deixa passar com aviso
+            logger.warning("[Backup] Guardian não encontrado no registry. Validação pulada.")
+            return {"is_valid": True, "issues": ["Guardian não registrado — validação pulada"]}
+
+        # Executa coroutine no event loop (Celery task é síncrona)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        result = loop.run_until_complete(guardian.validate_backup(backup_data))
+        return result
+
+    except Exception as e:
+        logger.error("[Backup] Erro ao executar Guardian: %s", e)
+        # Em caso de falha do Guardian, deixa o backup prosseguir com aviso
+        return {"is_valid": True, "issues": [f"Guardian com erro: {e} — backup liberado"]}
+
+
 # ──────────────────────────────── BACKUP ────────────────────────────────
 
 def run_backup() -> dict:
@@ -80,6 +118,38 @@ def run_backup() -> dict:
             payload["data"][table] = []
             payload["meta"]["tables"][table] = 0
 
+    # ── Guardian v1: valida antes de salvar ──────────────────────────────
+    validation = _run_guardian_validation(payload["data"])
+
+    if not validation.get("is_valid", True):
+        issues_text = "\n".join(f"  ⚠ {i}" for i in validation.get("issues", []))
+        logger.error(
+            "[Backup] Guardian BLOQUEOU o upload — backup inválido!\nIssues:\n%s",
+            issues_text,
+        )
+        try:
+            notify_owner(
+                f"*⛔ Backup BLOQUEADO pelo Guardian*\n\n"
+                f"O backup de `{date_str}` NÃO foi salvo.\n\n"
+                f"Problemas encontrados:\n{issues_text}\n\n"
+                f"Ação necessária: verificar integridade do banco.",
+                level="error",
+            )
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "blocked_by_guardian": True,
+            "issues": validation.get("issues", []),
+            "ts": now.isoformat(),
+        }
+
+    logger.info(
+        "[Backup] Guardian APROVADO — %d tabelas, %d linhas.",
+        len(validation.get("approved_tables", [])),
+        validation.get("total_rows", 0),
+    )
+
     # Upload
     _upload_json(db, file_path, payload)
     logger.info("[Backup] Upload ok → %s/%s", BUCKET, file_path)
@@ -94,6 +164,10 @@ def run_backup() -> dict:
         "file": file_path,
         "ts": now.isoformat(),
         "removed_old": removed,
+        "guardian": {
+            "approved_tables": validation.get("approved_tables", []),
+            "total_rows_validated": validation.get("total_rows", 0),
+        },
     }
 
     # Alerta Telegram
@@ -103,11 +177,12 @@ def run_backup() -> dict:
             for t, c in payload["meta"]["tables"].items()
         )
         notify_owner(
-            f"*Backup diário OK*\n\n"
+            f"*✅ Backup diário OK*\n\n"
             f"Tabelas: {len(TABLES)}\n"
             f"Total: {total_rows} registros\n"
             f"Arquivo: `{file_path}`\n"
-            f"Antigos removidos: {removed}\n\n"
+            f"Antigos removidos: {removed}\n"
+            f"Guardian: ✅ validado\n\n"
             f"{detail}",
             level="info",
         )

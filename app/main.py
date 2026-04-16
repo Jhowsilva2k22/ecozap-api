@@ -107,6 +107,16 @@ async def startup():
     if settings.instagram_account_id:
         logger.info(f"Instagram Account ID: {settings.instagram_account_id}")
 
+    # Registra todos os agentes da equipe autônoma
+    try:
+        from app.agents.registry import load_all_agents
+        load_all_agents()
+        from app.agents.registry import list_registered
+        registered = list_registered()
+        logger.info(f"[Agents] {len(registered)} agentes registrados: {registered}")
+    except Exception as e:
+        logger.error(f"[Agents] Falha ao carregar agentes: {e}")
+
     # Verifica colunas do banco
     try:
         from app.migrations import run_migrations
@@ -345,3 +355,46 @@ async def google_oauth_callback(code: str = "", state: str = "", error: str = ""
     except Exception as e:
         logger.error(f"[Google OAuth] Erro: {e}")
         return HTMLResponse("<html><body><h2>Erro ao conectar. Tente novamente.</h2></body></html>")
+
+
+# ---------------------------------------------------------------------------
+# Conselho de Agentes — /api/council/meeting
+# Convoca reunião com todos os agentes registrados.
+# ---------------------------------------------------------------------------
+@app.post("/api/council/meeting")
+async def council_meeting(request: Request, token: str = ""):
+    """
+    Convoca reunião do conselho de agentes.
+    Body JSON: { "subject": "...", "called_by": "ceo" }
+    Header ou query: ?token=ADMIN_TOKEN
+    """
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if admin_token and token != admin_token:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    subject = body.get("subject", "Reunião de alinhamento geral")
+    called_by = body.get("called_by", "ceo")
+
+    try:
+        from app.agents.council import Council
+        from app.agents.base import AgentContext
+        from app.agents.registry import load_all_agents
+
+        load_all_agents()  # garante que todos estão registrados
+
+        context = AgentContext(
+            tenant_id="system",
+            triggered_by=called_by,
+            payload=body,
+        )
+        council = Council()
+        minutes = await council.call_meeting(subject=subject, called_by=called_by, context=context)
+        return JSONResponse(content={"ok": True, "minutes": minutes})
+    except Exception as e:
+        logger.error(f"[Council] Erro na reunião: {e}")
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
