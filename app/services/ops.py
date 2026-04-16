@@ -257,7 +257,7 @@ def run_health_check() -> dict:
     # 3. Evolution API (WhatsApp)
     try:
         import httpx
-        evo_url = settings.whatsapp_api_url.rstrip("/")
+        evo_url = settings.evolution_api_url.rstrip("/")
         with httpx.Client(timeout=5.0) as client:
             resp = client.get(f"{evo_url}/")
             if resp.status_code < 500:
