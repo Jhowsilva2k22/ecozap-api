@@ -1,24 +1,105 @@
 """
-EcoZap — Doctor Agent
-======================
+EcoZap — Doctor Agent (Sprint 1 — implementação real)
+=======================================================
 Papel: Diagnóstico de erros e incidentes.
 Hierarquia: Especialista → OPS → CTO → CEO
 
 Responsabilidades:
-- Recebe anomalia do Sentinel
-- Acessa logs detalhados, stack traces, contexto
-- Identifica arquivo + linha + causa raiz
-- Cria relatório de diagnóstico estruturado
-- Passa diagnóstico para o Surgeon
+- Recebe anomalia do Sentinel via AgentContext
+- Lê últimos erros do Redis (ops.py tracking)
+- Classifica por padrão conhecido (banco, rede, código, config, recurso)
+- Mapeia arquivo + linha via traceback se disponível
+- Gera diagnóstico estruturado para o Surgeon
+- Envia resumo Telegram com causa raiz
 
 Opinion bias: "Científico e metódico. Não passa para o Surgeon sem causa raiz confirmada."
 """
+import json
 import logging
+import re
+import uuid
 from datetime import datetime, timezone
+from typing import Optional
+
+import redis as redis_lib
+
 from app.agents.base import Agent, AgentContext, AgentOpinion, AuthorityLevel
 from app.agents.registry import register
+from app.agents.message_bus import publish, Events
+from app.config import get_settings
+from app.services.alerts import notify_owner
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
+
+OPS_PREFIX = "ops:"
+
+# ──────────────────────── padrões conhecidos ────────────────────────
+# Cada padrão: (regex, causa_raiz, severidade, fix_hint)
+ERROR_PATTERNS = [
+    (
+        r"column .* does not exist|undefined_column|42703",
+        "Coluna inexistente no banco (PostgreSQL 42703)",
+        "critical",
+        "Verificar nome das colunas em tasks.py. Rodar SELECT column_name FROM information_schema.columns WHERE table_name='nome_tabela' no Supabase.",
+    ),
+    (
+        r"OperationalError|could not connect|connection refused|server closed|ECONNREFUSED",
+        "Falha de conexão com banco/Redis/serviço externo",
+        "critical",
+        "Verificar variáveis de ambiente (URLs, portas). Checar status dos serviços no Railway e Supabase dashboard.",
+    ),
+    (
+        r"TimeoutError|ReadTimeout|ConnectTimeout|timed out",
+        "Timeout em chamada HTTP/banco",
+        "warning",
+        "Verificar latência da Evolution API ou Supabase. Considerar aumentar timeout ou adicionar retry.",
+    ),
+    (
+        r"KeyError|AttributeError|NoneType.*has no attribute",
+        "Erro de atributo/chave — dado esperado ausente",
+        "warning",
+        "Verificar se estrutura de dados de resposta da API mudou. Adicionar .get() com fallback.",
+    ),
+    (
+        r"JSONDecodeError|json.decoder|Expecting value",
+        "Resposta não-JSON onde se esperava JSON",
+        "warning",
+        "Verificar resposta raw da API. Possível mudança de contrato ou erro de parsing.",
+    ),
+    (
+        r"rate limit|RateLimitError|429|too many requests",
+        "Rate limit atingido em API externa",
+        "warning",
+        "Implementar exponential backoff. Verificar uso da OpenAI/Evolution API no período.",
+    ),
+    (
+        r"OOM|MemoryError|Cannot allocate|out of memory",
+        "Falta de memória",
+        "critical",
+        "Verificar consumo de memória no Railway. Considerar otimizar queries ou aumentar plano.",
+    ),
+    (
+        r"SyntaxError|IndentationError|NameError",
+        "Erro de sintaxe Python — deploy com código inválido",
+        "critical",
+        "Verificar último commit. Rodar python -m py_compile no arquivo afetado.",
+    ),
+    (
+        r"ImportError|ModuleNotFoundError",
+        "Módulo Python não encontrado — dependência faltando",
+        "critical",
+        "Verificar requirements.txt. Possivelmente nova lib não instalada.",
+    ),
+    (
+        r"duplicate key|UniqueViolation|23505",
+        "Violação de chave única no banco",
+        "warning",
+        "Verificar upsert em vez de insert, ou verificar lógica de deduplicação.",
+    ),
+]
+
+FILE_PATTERN = re.compile(r'File "([^"]+)", line (\d+)')
 
 
 @register
@@ -47,38 +128,210 @@ class Doctor(Agent):
         Diagnostica um incidente recebido do Sentinel.
         Retorna diagnóstico estruturado para o Surgeon.
         """
-        anomaly = context.payload.get("anomaly", {})
-        logger.info(f"[Doctor] Diagnosticando: {anomaly}")
+        anomaly_payload = context.payload.get("anomaly", context.payload)
+        incident_id = context.incident_id or str(uuid.uuid4())[:8]
+
+        logger.info("[Doctor] Iniciando diagnóstico — incidente %s", incident_id)
 
         diagnosis = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "incident_id": context.incident_id,
-            "anomaly": anomaly,
+            "incident_id": incident_id,
+            "anomalies_received": anomaly_payload.get("anomalies", []),
             "root_cause": None,
-            "affected_file": None,
-            "affected_lines": [],
+            "root_cause_type": None,
+            "affected_files": [],
+            "severity": "unknown",
             "confidence": 0.0,
-            "recommended_fix": None,
+            "fix_hint": None,
+            "raw_errors": [],
             "needs_ceo_override": False,
+            "ready_for_surgeon": False,
         }
 
-        # TODO Sprint 1: implementar diagnóstico real
-        # 1. Acessar logs Railway via API
-        # 2. Extrair stack trace completo
-        # 3. Identificar padrão de erro (banco, rede, código, config)
-        # 4. Mapear para arquivo + linha via traceback
-        # 5. Classificar severidade
-        # 6. Gerar recomendação de fix
+        # 1. Coleta erros do Redis
+        raw_errors = self._collect_errors_from_redis()
+        diagnosis["raw_errors"] = raw_errors
 
-        logger.info(f"[Doctor] Diagnóstico concluído. Causa raiz: {diagnosis['root_cause']}")
+        # 2. Adiciona erros dos anomaly events do Sentinel
+        sentinel_anomalies = anomaly_payload.get("anomalies", [])
+        for a in sentinel_anomalies:
+            if a.get("type") in ("circuit_breaker_open", "circuit_near_open", "error_count_high"):
+                task = a.get("task", "")
+                last_err = self._get_last_error_redis(task)
+                if last_err:
+                    raw_errors.append(last_err)
+
+        # 3. Analisa padrões de erro
+        if raw_errors:
+            best_match = self._classify_errors(raw_errors)
+            if best_match:
+                diagnosis["root_cause"] = best_match["root_cause"]
+                diagnosis["root_cause_type"] = best_match["pattern"]
+                diagnosis["severity"] = best_match["severity"]
+                diagnosis["fix_hint"] = best_match["fix_hint"]
+                diagnosis["confidence"] = best_match["confidence"]
+
+        # Se não achou via Redis, usa anomalias do Sentinel diretamente
+        if not diagnosis["root_cause"] and sentinel_anomalies:
+            worst = sorted(
+                sentinel_anomalies,
+                key=lambda a: 0 if a.get("severity") == "critical" else 1
+            )
+            if worst:
+                a = worst[0]
+                diagnosis["root_cause"] = a.get("message", "Anomalia não classificada")
+                diagnosis["severity"] = a.get("severity", "warning")
+                diagnosis["confidence"] = 0.5
+
+        # 4. Extrai arquivos/linhas do traceback se disponível
+        for err in raw_errors:
+            tb = err.get("traceback", "") or err.get("message", "")
+            files = self._extract_files_from_traceback(tb)
+            for f in files:
+                if f not in diagnosis["affected_files"]:
+                    diagnosis["affected_files"].append(f)
+
+        # 5. Decide se passa para Surgeon
+        if diagnosis["root_cause"] and diagnosis["confidence"] >= 0.6:
+            diagnosis["ready_for_surgeon"] = True
+            if diagnosis["severity"] == "critical":
+                diagnosis["needs_ceo_override"] = True  # cirurgia crítica = CEO aprova
+
+        logger.info(
+            "[Doctor] Diagnóstico: '%s' (severidade=%s, confiança=%.0f%%, surgeon=%s)",
+            diagnosis["root_cause"],
+            diagnosis["severity"],
+            diagnosis["confidence"] * 100,
+            diagnosis["ready_for_surgeon"],
+        )
+
+        # 6. Publica diagnóstico no message bus
+        try:
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=3)
+            await publish(r, self.role, Events.DIAGNOSIS_READY, {
+                "incident_id": incident_id,
+                "diagnosis": diagnosis,
+                "tenant_id": context.tenant_id,
+            })
+        except Exception as e:
+            logger.warning("[Doctor] Falha ao publicar diagnóstico: %s", e)
+
+        # 7. Alerta Telegram com diagnóstico
+        if diagnosis["root_cause"]:
+            try:
+                icon = "🚨" if diagnosis["severity"] == "critical" else "⚠️"
+                msg = (
+                    f"{icon} *Doctor — Diagnóstico #{incident_id}*\n\n"
+                    f"*Causa raiz:* {diagnosis['root_cause']}\n"
+                    f"*Severidade:* {diagnosis['severity']}\n"
+                    f"*Confiança:* {int(diagnosis['confidence'] * 100)}%\n"
+                )
+                if diagnosis["affected_files"]:
+                    files_str = "\n".join(
+                        f"  `{f['file']}:{f['line']}`"
+                        for f in diagnosis["affected_files"][:3]
+                    )
+                    msg += f"\n*Arquivos afetados:*\n{files_str}\n"
+                if diagnosis["fix_hint"]:
+                    msg += f"\n*Fix sugerido:* {diagnosis['fix_hint'][:200]}"
+                if diagnosis["ready_for_surgeon"]:
+                    msg += "\n\n_Encaminhando para Surgeon..._"
+
+                notify_owner(msg, level="error" if diagnosis["severity"] == "critical" else "warn")
+            except Exception as e:
+                logger.warning("[Doctor] Falha ao notificar Telegram: %s", e)
+
         return diagnosis
 
+    # ──────────────────── helpers ────────────────────────────
+
+    def _collect_errors_from_redis(self) -> list:
+        """Coleta últimos erros de todas as tasks do Redis."""
+        errors = []
+        try:
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=3)
+            keys = r.keys(f"{OPS_PREFIX}last_error:*")
+            for key in keys:
+                try:
+                    data = json.loads(r.get(key) or "{}")
+                    if data:
+                        data["task"] = key.replace(f"{OPS_PREFIX}last_error:", "")
+                        errors.append(data)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("[Doctor] Falha ao ler erros do Redis: %s", e)
+        return errors
+
+    def _get_last_error_redis(self, task_name: str) -> Optional[dict]:
+        """Lê último erro de uma task específica."""
+        try:
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=3)
+            data = r.get(f"{OPS_PREFIX}last_error:{task_name}")
+            if data:
+                return json.loads(data)
+        except Exception:
+            pass
+        return None
+
+    def _classify_errors(self, errors: list) -> Optional[dict]:
+        """Classifica erros contra padrões conhecidos. Retorna melhor match."""
+        best = None
+        for err in errors:
+            text = (
+                str(err.get("message", "")) + " " +
+                str(err.get("traceback", "")) + " " +
+                str(err.get("type", ""))
+            ).lower()
+
+            for pattern, root_cause, severity, fix_hint in ERROR_PATTERNS:
+                if re.search(pattern, text, re.IGNORECASE):
+                    confidence = 0.9 if severity == "critical" else 0.75
+                    candidate = {
+                        "pattern": pattern[:50],
+                        "root_cause": root_cause,
+                        "severity": severity,
+                        "fix_hint": fix_hint,
+                        "confidence": confidence,
+                        "matched_error": err.get("message", "")[:200],
+                    }
+                    # Prefere críticos
+                    if best is None or (severity == "critical" and best["severity"] != "critical"):
+                        best = candidate
+
+        return best
+
+    def _extract_files_from_traceback(self, traceback_text: str) -> list:
+        """Extrai pares (arquivo, linha) do traceback Python."""
+        files = []
+        if not traceback_text:
+            return files
+        for match in FILE_PATTERN.finditer(traceback_text):
+            fp = match.group(1)
+            line = int(match.group(2))
+            # Só arquivos do projeto (app/)
+            if "app/" in fp or "whatsapp" in fp or "ecozap" in fp:
+                files.append({"file": fp, "line": line})
+        return files[-3:]  # máx 3 arquivos mais próximos do erro
+
     async def report_status(self) -> dict:
+        """Status rápido para reunião."""
+        try:
+            r = redis_lib.from_url(settings.redis_url, decode_responses=True, socket_connect_timeout=3)
+            keys = r.keys(f"{OPS_PREFIX}last_error:*")
+            tasks_with_errors = [k.replace(f"{OPS_PREFIX}last_error:", "") for k in keys]
+        except Exception:
+            tasks_with_errors = []
+
         return {
             "role": self.role,
             "status": "operational",
-            "last_diagnosis": None,
-            "summary": "Diagnóstico sob demanda. Aguardando incidentes.",
+            "tasks_with_known_errors": tasks_with_errors,
+            "summary": (
+                f"Diagnóstico sob demanda. {len(tasks_with_errors)} task(s) com histórico de erro."
+                if tasks_with_errors else
+                "Diagnóstico sob demanda. Sem histórico de erros no Redis."
+            ),
         }
 
     def opine(self, question: str, context: AgentContext) -> AgentOpinion:
@@ -87,6 +340,7 @@ class Doctor(Agent):
             agrees=True,
             reasoning=(
                 f"[{self.display_name}] Qualquer mudança crítica deve ter "
-                f"diagnóstico de estado atual antes e validação depois."
+                f"estado diagnosticado antes e validação de logs depois. "
+                f"Sempre confirmo causa raiz antes de escalar para Surgeon."
             ),
         )

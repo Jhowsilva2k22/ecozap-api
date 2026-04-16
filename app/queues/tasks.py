@@ -151,6 +151,12 @@ celery_app.conf.update(
             "schedule": crontab(hour="1,7,13,19", minute=0),  # 4x ao dia em horários fixos
             "options": {"queue": "learning"},
         },
+        # ── AGENTES AUTÔNOMOS: Sentinel a cada 5 min ──
+        "sentinel-monitor": {
+            "task": "app.queues.tasks.sentinel_monitor",
+            "schedule": 300.0,  # a cada 5 minutos
+            "options": {"queue": "learning"},
+        },
     },
 )
 
@@ -628,6 +634,70 @@ def daily_ops_report(self):
 
     except Exception as exc:
         logger.error(f"Erro ao gerar ops report: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=1, default_retry_delay=60, queue="learning")
+def sentinel_monitor(self):
+    """
+    Ciclo de monitoramento autônomo do Sentinel.
+    Roda a cada 5 minutos via Celery Beat.
+    Detecta anomalias, aciona Doctor se necessário.
+    """
+    try:
+        from app.agents.registry import load_all_agents, get_agent
+        from app.agents.base import AgentContext
+
+        load_all_agents()
+        sentinel = get_agent("sentinel")
+        if not sentinel:
+            logger.warning("[sentinel_monitor] Sentinel não encontrado no registry")
+            return
+
+        context = AgentContext(
+            tenant_id="system",
+            triggered_by="celery_beat",
+            payload={"source": "scheduled"},
+        )
+
+        findings = run_async(sentinel.act(context))
+        status = findings.get("status", "unknown")
+        anomaly_count = len(findings.get("anomalies", []))
+
+        logger.info("[sentinel_monitor] Status=%s, anomalias=%d", status, anomaly_count)
+
+        # Se houver anomalias críticas, aciona o Doctor imediatamente
+        if anomaly_count > 0:
+            doctor = get_agent("doctor")
+            if doctor:
+                import uuid
+                incident_id = str(uuid.uuid4())[:8]
+                doctor_context = AgentContext(
+                    tenant_id="system",
+                    triggered_by="sentinel",
+                    incident_id=incident_id,
+                    payload={
+                        "anomaly": findings,
+                        "anomalies": findings.get("anomalies", []),
+                        "triggered_by_sentinel": True,
+                    },
+                )
+                diagnosis = run_async(doctor.act(doctor_context))
+
+                # Se diagnóstico pronto para Surgeon, aciona
+                if diagnosis.get("ready_for_surgeon"):
+                    surgeon = get_agent("surgeon")
+                    if surgeon:
+                        surgeon_context = AgentContext(
+                            tenant_id="system",
+                            triggered_by="doctor",
+                            incident_id=incident_id,
+                            payload={"diagnosis": diagnosis},
+                        )
+                        run_async(surgeon.act(surgeon_context))
+
+    except Exception as exc:
+        logger.error(f"[sentinel_monitor] Erro: {exc}")
         raise self.retry(exc=exc)
 
 
