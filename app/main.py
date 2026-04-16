@@ -1,12 +1,45 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from app.routers import webhook, onboarding, panel, instagram_webhook
-from app.config import get_settings
+"""
+Entry point FastAPI.
+Fase 1 — Observabilidade: Sentry + alerta Telegram + health checks reais.
+Preserva 100% do comportamento original (WhatsApp, Instagram, painel, onboarding).
+"""
+import os
 import logging
 import httpx
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+# ---------------------------------------------------------------------------
+# Sentry precisa ser inicializado ANTES de importar a app FastAPI.
+# ---------------------------------------------------------------------------
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.starlette import StarletteIntegration
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=os.getenv("APP_ENV", "production"),
+            traces_sample_rate=0.1,
+            profiles_sample_rate=0.0,
+            send_default_pii=False,
+            integrations=[StarletteIntegration(), FastApiIntegration()],
+        )
+    except ImportError:
+        logging.warning("[Sentry] sentry-sdk não instalado, pulando init")
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from app.routers import webhook, onboarding, panel, instagram_webhook, health
+from app.config import get_settings
+from app.services.alerts import notify_owner, notify_boot, notify_error
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
@@ -15,18 +48,27 @@ app = FastAPI(
     description="Agente de IA para qualificacao de leads e atendimento no WhatsApp",
     version="1.0.0",
     docs_url="/docs" if settings.debug else None,
-    redoc_url=None
+    redoc_url=None,
 )
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(webhook.router, tags=["WhatsApp"])
 app.include_router(instagram_webhook.router, tags=["Instagram"])
 app.include_router(onboarding.router, prefix="/api", tags=["Onboarding"])
 app.include_router(panel.router, tags=["Panel"])
+app.include_router(health.router, tags=["Health"])
+
 
 @app.get("/")
 async def root():
     return {"service": "WhatsApp AI Agent", "status": "online", "version": "1.0.0"}
+
 
 async def _subscribe_instagram_webhook():
     """Garante que a Page está inscrita no webhook de mensagens do Instagram."""
@@ -46,23 +88,65 @@ async def _subscribe_instagram_webhook():
     except Exception as e:
         logger.error(f"[IG Startup] Falha ao renovar subscribed_apps: {e}")
 
+
 @app.on_event("startup")
 async def startup():
     logger.info("WhatsApp AI Agent iniciado")
     logger.info(f"Instancia Evolution: {settings.evolution_instance}")
     if settings.instagram_account_id:
         logger.info(f"Instagram Account ID: {settings.instagram_account_id}")
+
     # Verifica colunas do banco
     try:
         from app.migrations import run_migrations
         result = await run_migrations()
         if result.get("missing"):
             logger.warning(f"⚠️ COLUNAS FALTANDO NO BANCO: {result['missing']}")
+            try:
+                notify_owner(
+                    f"Colunas faltando no banco: {result['missing']}",
+                    level="warn",
+                )
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Erro na verificação de migração: {e}")
+
     # Renova subscription do webhook Instagram automaticamente
     if settings.meta_page_id and settings.meta_page_token:
         await _subscribe_instagram_webhook()
+
+    # Alerta Telegram de boot
+    try:
+        notify_boot("whatsapp-agent")
+    except Exception as e:
+        logger.error(f"[Ops] Falha no notify_boot: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Handler global de exceção — Sentry captura automático, Telegram pra ver rápido
+# ---------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def _ops_global_exc(request: Request, exc: Exception):
+    try:
+        notify_error(f"{request.method} {request.url.path}", exc)
+    except Exception:
+        pass
+    logger.exception(f"Unhandled exception em {request.method} {request.url.path}")
+    return JSONResponse(status_code=500, content={"error": "internal_error"})
+
+
+# ---------------------------------------------------------------------------
+# Rota de DEBUG — só pra testar o alerta end-to-end.
+# APAGAR DEPOIS DE CONFIRMAR que o alerta cai no Telegram e no Sentry.
+# Protegida por token pra não ficar exposta.
+# ---------------------------------------------------------------------------
+@app.get("/debug/raise")
+async def _debug_raise(token: str = ""):
+    if token != settings.app_secret:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token inválido")
+    raise RuntimeError("teste ops — se caiu no Telegram e no Sentry, alerta OK")
 
 
 @app.get("/privacy", response_class=HTMLResponse)

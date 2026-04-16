@@ -3,9 +3,54 @@ from app.config import get_settings
 from urllib.parse import quote
 import asyncio
 import logging
+import os
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# ---------------------------------------------------------------------------
+# Sentry init pro worker Celery (Fase 1 — Observabilidade)
+# ---------------------------------------------------------------------------
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.celery import CeleryIntegration
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=os.getenv("APP_ENV", "production"),
+            traces_sample_rate=0.1,
+            profiles_sample_rate=0.0,
+            send_default_pii=False,
+            integrations=[CeleryIntegration()],
+        )
+    except ImportError:
+        logger.warning("[Sentry] sentry-sdk não instalado no worker")
+
+
+# ---------------------------------------------------------------------------
+# Decorator de alerta ops (Telegram + Sentry capture pela CeleryIntegration)
+# ---------------------------------------------------------------------------
+from app.services.alerts import notify_error  # noqa: E402
+
+
+def with_ops_alert(context_name: str):
+    """Em erro: avisa Telegram + re-levanta pra Celery fazer retry."""
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                try:
+                    notify_error(f"celery.{context_name}", e)
+                except Exception:
+                    pass
+                raise
+        return wrapper
+    return decorator
 
 
 def _panel_url() -> str:
@@ -64,6 +109,7 @@ def run_async(coro):
         loop.close()
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
+@with_ops_alert("process_message")
 def process_message(self, phone: str, owner_id: str, message: str, agent_mode: str,
                     message_id: str = "", media_type: str = "text"):
     try:
@@ -75,6 +121,7 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
+@with_ops_alert("process_buffered")
 def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
     """Processa mensagens agrupadas do buffer Redis (rate limiting).
     Mídias são pré-analisadas e tudo vira uma mensagem unificada pro agente."""
@@ -193,6 +240,7 @@ def nightly_learning(owner_id: str):
 
 
 @celery_app.task(queue="learning")
+@with_ops_alert("nightly_learning_all")
 def nightly_learning_all():
     """Roda o aprendizado noturno para todos os donos cadastrados."""
     from app.database import get_db
@@ -275,6 +323,7 @@ def learn_from_links(self, owner_id: str, links: list):
 # ── Follow-up: conversa ativa (5min → 10-15min) ────────────────────────────
 
 @celery_app.task(bind=True, max_retries=0, queue="messages")
+@with_ops_alert("follow_up_active")
 def follow_up_active(self, phone: str, owner_id: str, attempt: int = 1):
     """Follow-up para leads que pararam de responder numa conversa ativa.
     attempt=1 → 5 min depois da última msg
@@ -390,6 +439,7 @@ def follow_up_active(self, phone: str, owner_id: str, attempt: int = 1):
 # ── Follow-up: leads frios (24h → 3d → 7d) ─────────────────────────────────
 
 @celery_app.task(queue="messages")
+@with_ops_alert("follow_up_cold_leads")
 def follow_up_cold_leads():
     """Verifica leads frios e envia follow-up escalonado.
     Roda via Celery Beat a cada 1h.
@@ -536,6 +586,7 @@ def follow_up_cold_leads():
 # ── Nurturing: clientes ativos (semanal + aniversário) ──────────────────────
 
 @celery_app.task(queue="messages")
+@with_ops_alert("nurture_customers")
 def nurture_customers():
     """Mantém relacionamento com clientes existentes.
     Roda via Celery Beat a cada 12h.
