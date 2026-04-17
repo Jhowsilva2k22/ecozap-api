@@ -6,6 +6,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 MAX_RAW_TURNS = 10  # pares de mensagens antes de comprimir
+MAX_SUMMARY_CHARS = 2000  # limite para o campo summary não crescer indefinidamente
 
 class MemoryService:
     def __init__(self):
@@ -61,7 +62,11 @@ class MemoryService:
         await self._maybe_compress(phone, owner_id)
 
     async def _maybe_compress(self, phone: str, owner_id: str):
-        """Comprime histórico antigo em resumo para economizar tokens."""
+        """Comprime histórico antigo em resumo acumulativo para economizar tokens.
+
+        IMPORTANTE: DELETE só acontece se o summary foi salvo com sucesso.
+        Antes esse bug causava perda permanente de memória quando a compressão falhava.
+        """
         result = self.db.table("messages").select("id,role,content").eq("phone", phone).eq("owner_id", owner_id).order("created_at").execute()
         if not result.data:
             return
@@ -73,21 +78,43 @@ class MemoryService:
         if not to_compress:
             return
 
+        compressed_ok = False
         try:
             from app.services.ai import AIService
             summary_text = await AIService().compress_conversation(to_compress)
             if summary_text:
                 customer = self.db.table("customers").select("summary").eq("phone", phone).eq("owner_id", owner_id).limit(1).execute()
                 existing = (customer.data[0].get("summary") or "") if customer and customer.data else ""
+
+                # Resumo acumulativo: preserva contexto anterior em vez de sobrescrever
+                # Antes: cada compressão descartava o histórico anterior → bot perdia memória longa
+                if existing:
+                    new_summary = f"{existing}\n\n[Continuação]:\n{summary_text}"
+                else:
+                    new_summary = summary_text
+
+                # Mantém notas especiais do dono (linhas que começam com [Nota)
                 notes = "\n".join(line for line in existing.split("\n") if line.strip().startswith("[Nota"))
-                new_summary = f"{summary_text}\n{notes}".strip() if notes else summary_text
+                if notes and notes not in new_summary:
+                    new_summary = f"{new_summary}\n{notes}"
+
+                # Limita tamanho para não crescer indefinidamente
+                if len(new_summary) > MAX_SUMMARY_CHARS:
+                    new_summary = new_summary[-MAX_SUMMARY_CHARS:]
+
                 self.db.table("customers").update({"summary": new_summary}).eq("phone", phone).eq("owner_id", owner_id).execute()
+                compressed_ok = True
         except Exception as e:
             logger.error(f"[Memory] Erro ao comprimir histórico: {e}")
 
-        old_ids = [m["id"] for m in to_compress]
-        self.db.table("messages").delete().in_("id", old_ids).execute()
-        logger.info(f"[Memory] Comprimiu {len(old_ids)} msgs de {phone}")
+        # Só deleta mensagens antigas se o resumo foi salvo com sucesso
+        # Antes esse bug deletava mensagens mesmo quando a compressão falhava → memória perdida
+        if compressed_ok:
+            old_ids = [m["id"] for m in to_compress]
+            self.db.table("messages").delete().in_("id", old_ids).execute()
+            logger.info(f"[Memory] Comprimiu {len(old_ids)} msgs de {phone}")
+        else:
+            logger.warning(f"[Memory] Compressão falhou — mensagens preservadas para {phone}")
 
     async def get_owner_context(self, owner_id: str) -> Optional[dict]:
         # Lê da tabela tenants (tabela owners está obsoleta/vazia)
@@ -139,7 +166,6 @@ class MemoryService:
             if not any(c in vowels for c in w):
                 return False
             # Ratio de chars únicos vs total: mínimo 50%
-            # Pega "Geueueu" (3 únicos / 7 total = 43%) → rejeita
             if len(w) > 3 and len(set(w)) / len(w) < 0.5:
                 return False
             # Não pode ter 3+ chars idênticos consecutivos
@@ -151,11 +177,9 @@ class MemoryService:
         """Detecta nome do lead SOMENTE quando o bot já perguntou pelo nome.
         Também valida se o texto realmente parece um nome próprio.
         """
-        # Só captura nome se o bot realmente pediu na mensagem anterior
         if not history:
             return None
 
-        # Verifica se a última mensagem do assistente pede o nome
         last_assistant = ""
         for msg in reversed(history):
             if msg.get("role") == "assistant":
@@ -183,7 +207,6 @@ class MemoryService:
         if "http" in msg:
             return None
 
-        # Valida se parece nome real (rejeita "Geueueu", spam, etc.)
         if not self._looks_like_real_name(clean):
             logger.info(f"[Memory] Texto rejeitado como nome (não parece nome real): '{clean}' ({phone})")
             return None
