@@ -15,9 +15,24 @@ class MemoryService:
         result = self.db.table("customers").select("*").eq("phone", phone).eq("owner_id", owner_id).maybe_single().execute()
         if result and result.data:
             return CustomerProfile(**result.data)
-        new_customer = CustomerProfile(phone=phone, owner_id=owner_id, first_contact=datetime.utcnow(), last_contact=datetime.utcnow())
-        self.db.table("customers").insert(new_customer.model_dump(mode='json')).execute()
-        return new_customer
+
+        # Novo lead — insere no banco e retorna o registro criado
+        now = datetime.utcnow().isoformat()
+        new_data = {
+            "phone": phone,
+            "owner_id": owner_id,
+            "lead_score": 0,
+            "lead_status": "qualificando",
+            "total_messages": 0,
+            "first_contact": now,
+            "last_contact": now,
+        }
+        insert_result = self.db.table("customers").insert(new_data).execute()
+        if insert_result and insert_result.data:
+            return CustomerProfile(**insert_result.data[0])
+
+        # Fallback seguro se insert não retornar dados
+        return CustomerProfile(phone=phone, owner_id=owner_id)
 
     async def update_customer(self, phone: str, owner_id: str, updates: dict):
         updates["last_contact"] = datetime.utcnow().isoformat()
