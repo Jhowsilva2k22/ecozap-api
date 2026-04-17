@@ -45,6 +45,16 @@ async def receive_whatsapp(request: Request):
 
     message = whatsapp.parse_webhook(payload)
     if not message:
+        # Log para diagnóstico: revela por que mensagens são ignoradas
+        # (event desconhecido, fromMe=True, tipo de mídia não mapeado, etc.)
+        data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+        msg_keys = list(data.get("message", {}).keys()) if isinstance(data.get("message"), dict) else []
+        logger.info(
+            f"[Webhook] Ignorado: event={payload.get('event')} "
+            f"instance={payload.get('instance')} "
+            f"fromMe={data.get('key', {}).get('fromMe')} "
+            f"msg_keys={msg_keys}"
+        )
         return {"status": "ignored"}
 
     # ── Deduplicação por message_id ──────────────────────────────────────────
