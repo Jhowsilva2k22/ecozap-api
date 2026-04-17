@@ -33,7 +33,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from app.routers import webhook, onboarding, panel, instagram_webhook, health, tenant_api
+from app.routers import webhook, onboarding, panel, instagram_webhook, health, tenant_api, billing
 from app.config import get_settings
 from app.services.alerts import notify_owner, notify_boot, notify_error
 
@@ -74,6 +74,7 @@ app.include_router(onboarding.router, prefix="/api", tags=["Onboarding"])
 app.include_router(panel.router, tags=["Panel"])
 app.include_router(health.router, tags=["Health"])
 app.include_router(tenant_api.router, prefix="/api", tags=["Tenant Panel"])
+app.include_router(billing.router, tags=["Billing"])
 
 
 @app.get("/")

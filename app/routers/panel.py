@@ -332,6 +332,7 @@ def _build_html(token: str) -> str:
   <nav style="display:flex;gap:6px;margin-left:16px">
     <a href="/panel?token={token}" style="background:#252525;border:1px solid #333;border-radius:8px;padding:5px 14px;color:#fff;font-size:13px;text-decoration:none;font-weight:600">Leads</a>
     <a href="/panel/knowledge-ui?token={token}" style="background:transparent;border:1px solid #2a2a2a;border-radius:8px;padding:5px 14px;color:#888;font-size:13px;text-decoration:none">Conhecimento</a>
+    <a href="/panel/billing?token={token}" style="background:transparent;border:1px solid #2a2a2a;border-radius:8px;padding:5px 14px;color:#888;font-size:13px;text-decoration:none">Billing</a>
   </nav>
   <span id="last-update" style="margin-left:auto"></span>
 </div>
@@ -848,6 +849,274 @@ async function saveItem() {{
 
 // Init
 loadOwner().then(loadKB);
+</script>
+</body>
+</html>"""
+
+
+# ── Billing: status da assinatura (API) ──────────────────────────────────────
+
+@router.get("/panel/billing/status")
+async def panel_billing_status(token: str = Query(...), owner_id: str = Query(...)):
+    _check_token(token)
+    db = memory.db
+    owner = db.table("owners").select(
+        "id, business_name, plan_id, sub_status, trial_ends_at, sub_ends_at, stripe_customer_id"
+    ).eq("id", owner_id).maybe_single().execute()
+
+    if not (owner and owner.data):
+        raise HTTPException(status_code=404, detail="Owner não encontrado")
+
+    from app.models.plans import PLANS
+    from datetime import datetime
+    o = owner.data
+    plan = PLANS.get(o.get("plan_id", "starter"))
+    month = datetime.utcnow().strftime("%Y-%m")
+    usage_row = db.table("usage_logs").select("messages_count").eq("owner_id", owner_id).eq("month", month).maybe_single().execute()
+    used = (usage_row.data or {}).get("messages_count", 0)
+
+    return {
+        "owner_id": owner_id,
+        "business_name": o.get("business_name"),
+        "plan": plan.to_dict() if plan else None,
+        "sub_status": o.get("sub_status", "trial"),
+        "trial_ends_at": o.get("trial_ends_at"),
+        "sub_ends_at": o.get("sub_ends_at"),
+        "usage": {"month": month, "used": used, "limit": plan.msg_limit if plan else 1000},
+    }
+
+
+# ── Billing: página HTML ─────────────────────────────────────────────────────
+
+@router.get("/panel/billing", response_class=HTMLResponse)
+async def panel_billing_ui(request: Request, token: str = Query(...), owner_id: str = Query("")):
+    _check_token(token)
+    return HTMLResponse(_build_billing_html(token, owner_id))
+
+
+def _build_billing_html(token: str, owner_id: str) -> str:
+    from app.models.plans import PLANS
+    import json
+    plans_json = json.dumps([p.to_dict() for p in PLANS.values()])
+
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⚡ EcoZap — Billing</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,sans-serif;background:#0f0f0f;color:#e2e8f0;min-height:100vh}}
+nav{{background:#1a1a2e;border-bottom:1px solid #2d2d4e;padding:12px 24px;display:flex;align-items:center;gap:16px}}
+nav .brand{{font-weight:700;font-size:1.1rem;color:#7c3aed}}
+nav a{{color:#94a3b8;text-decoration:none;font-size:.85rem;padding:4px 10px;border-radius:6px;transition:all .2s}}
+nav a:hover,nav a.active{{background:#2d2d4e;color:#e2e8f0}}
+.container{{max-width:900px;margin:32px auto;padding:0 24px}}
+.section{{background:#1a1a2e;border:1px solid #2d2d4e;border-radius:12px;padding:24px;margin-bottom:24px}}
+.section h2{{font-size:1rem;color:#94a3b8;margin-bottom:16px;text-transform:uppercase;letter-spacing:.05em}}
+.status-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}
+.stat-card{{background:#0f0f1a;border:1px solid #2d2d4e;border-radius:8px;padding:16px;text-align:center}}
+.stat-card .val{{font-size:1.6rem;font-weight:700;color:#7c3aed}}
+.stat-card .label{{font-size:.8rem;color:#64748b;margin-top:4px}}
+.progress-bar{{background:#2d2d4e;border-radius:99px;height:10px;margin-top:8px;overflow:hidden}}
+.progress-fill{{height:100%;border-radius:99px;background:linear-gradient(90deg,#7c3aed,#06b6d4);transition:width .5s}}
+.plans-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}}
+.plan-card{{background:#0f0f1a;border:2px solid #2d2d4e;border-radius:12px;padding:20px;text-align:center;transition:all .2s;cursor:pointer}}
+.plan-card:hover,.plan-card.current{{border-color:#7c3aed;background:#1a1a2e}}
+.plan-card.current{{position:relative}}
+.plan-card.current::before{{content:'Plano atual';position:absolute;top:-10px;left:50%;transform:translateX(-50%);background:#7c3aed;color:#fff;font-size:.7rem;padding:2px 10px;border-radius:99px}}
+.plan-name{{font-size:1.1rem;font-weight:700;margin-bottom:4px}}
+.plan-price{{font-size:1.8rem;font-weight:800;color:#7c3aed;margin:8px 0}}
+.plan-price span{{font-size:.8rem;color:#64748b;font-weight:400}}
+.plan-features{{list-style:none;margin-top:12px;text-align:left}}
+.plan-features li{{font-size:.82rem;color:#94a3b8;padding:3px 0}}
+.plan-features li::before{{content:'✓ ';color:#10b981}}
+.btn{{display:inline-block;padding:10px 20px;border-radius:8px;font-weight:600;cursor:pointer;border:none;font-size:.9rem;transition:all .2s}}
+.btn-primary{{background:#7c3aed;color:#fff}}
+.btn-primary:hover{{background:#6d28d9}}
+.btn-danger{{background:#ef4444;color:#fff}}
+.btn-danger:hover{{background:#dc2626}}
+.btn-ghost{{background:transparent;border:1px solid #4b5563;color:#94a3b8}}
+.badge{{display:inline-block;padding:3px 10px;border-radius:99px;font-size:.75rem;font-weight:600}}
+.badge-trial{{background:#1e3a5f;color:#60a5fa}}
+.badge-active{{background:#14532d;color:#4ade80}}
+.badge-past_due{{background:#7c2d12;color:#fca5a5}}
+.badge-canceled{{background:#374151;color:#9ca3af}}
+.history-table{{width:100%;border-collapse:collapse}}
+.history-table th,.history-table td{{padding:10px 12px;text-align:left;border-bottom:1px solid #2d2d4e;font-size:.85rem}}
+.history-table th{{color:#64748b;font-weight:500}}
+.empty{{text-align:center;color:#475569;padding:40px}}
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="brand">⚡ EcoZap</span>
+  <a href="/panel?token={token}&owner_id={owner_id}">Leads</a>
+  <a href="/panel/knowledge-ui?token={token}&owner_id={owner_id}">Conhecimento</a>
+  <a href="/panel/billing?token={token}&owner_id={owner_id}">Billing</a>
+  <a href="/panel/billing?token={token}&owner_id={owner_id}" class="active">Billing</a>
+</nav>
+
+<div class="container">
+
+  <!-- Status atual -->
+  <div class="section">
+    <h2>Status da Assinatura</h2>
+    <div id="status-area"><p class="empty">Carregando...</p></div>
+  </div>
+
+  <!-- Uso do mês -->
+  <div class="section">
+    <h2>Uso este Mês</h2>
+    <div id="usage-area"><p class="empty">Carregando...</p></div>
+  </div>
+
+  <!-- Planos -->
+  <div class="section">
+    <h2>Planos Disponíveis</h2>
+    <div class="plans-grid" id="plans-grid"></div>
+  </div>
+
+  <!-- Histórico de pagamentos -->
+  <div class="section">
+    <h2>Histórico</h2>
+    <div id="history-area"><p class="empty">Carregando...</p></div>
+  </div>
+
+</div>
+
+<script>
+const TOKEN = '{token}';
+const OWNER_ID = '{owner_id}';
+const PLANS = {plans_json};
+let currentStatus = {{}};
+
+async function loadStatus() {{
+  if (!OWNER_ID) return;
+  const r = await fetch(`/panel/billing/status?token=${{TOKEN}}&owner_id=${{OWNER_ID}}`);
+  if (!r.ok) {{ document.getElementById('status-area').innerHTML = '<p class="empty">Erro ao carregar</p>'; return; }}
+  currentStatus = await r.json();
+  renderStatus();
+  renderUsage();
+}}
+
+function renderStatus() {{
+  const s = currentStatus;
+  if (!s || !s.plan) return;
+  const badgeClass = 'badge-' + (s.sub_status || 'trial');
+  const statusLabel = {{trial:'Trial',active:'Ativo',past_due:'Pagamento pendente',canceled:'Cancelado'}}[s.sub_status] || s.sub_status;
+  document.getElementById('status-area').innerHTML = `
+    <div class="status-grid">
+      <div class="stat-card">
+        <div class="val">${{s.plan.name}}</div>
+        <div class="label">Plano atual</div>
+      </div>
+      <div class="stat-card">
+        <div class="val"><span class="badge ${{badgeClass}}">${{statusLabel}}</span></div>
+        <div class="label">Status</div>
+      </div>
+      <div class="stat-card">
+        <div class="val">R$ ${{s.plan.price_monthly.toFixed(2)}}</div>
+        <div class="label">Mensalidade</div>
+      </div>
+      ${{s.trial_ends_at && s.sub_status === 'trial' ? `
+      <div class="stat-card">
+        <div class="val" style="font-size:1rem">${{fmtDate(s.trial_ends_at)}}</div>
+        <div class="label">Trial termina em</div>
+      </div>` : ''}}
+    </div>
+    ${{s.sub_status === 'active' ? `
+    <div style="margin-top:16px">
+      <button class="btn btn-danger" onclick="cancelSub()">Cancelar assinatura</button>
+    </div>` : ''}}
+  `;
+}}
+
+function renderUsage() {{
+  const u = currentStatus.usage;
+  if (!u) return;
+  const pct = u.limit === -1 ? 0 : Math.min(100, Math.round(u.used / u.limit * 100));
+  const limitLabel = u.limit === -1 ? '∞' : u.limit.toLocaleString('pt-BR');
+  const color = pct >= 90 ? '#ef4444' : pct >= 70 ? '#f59e0b' : '#7c3aed';
+  document.getElementById('usage-area').innerHTML = `
+    <div style="margin-bottom:8px;font-size:.9rem;color:#94a3b8">
+      <strong style="color:#e2e8f0">${{u.used.toLocaleString('pt-BR')}}</strong> de ${{limitLabel}} mensagens — ${{u.month}}
+    </div>
+    ${{u.limit !== -1 ? `
+    <div class="progress-bar"><div class="progress-fill" style="width:${{pct}}%;background:${{color}}"></div></div>
+    <div style="text-align:right;font-size:.75rem;color:#64748b;margin-top:4px">${{pct}}%</div>` : '<p style="color:#4ade80">✓ Mensagens ilimitadas</p>'}}
+  `;
+}}
+
+function renderPlans() {{
+  const currentPlan = (currentStatus.plan || {{}}).id || 'starter';
+  document.getElementById('plans-grid').innerHTML = PLANS.map(p => `
+    <div class="plan-card ${{p.id === currentPlan ? 'current' : ''}}" onclick="selectPlan('${{p.id}}')">
+      <div class="plan-name">${{p.name}}</div>
+      <div class="plan-price">R$ ${{p.price_monthly.toFixed(0)}} <span>/mês</span></div>
+      <div style="font-size:.82rem;color:#64748b;margin-bottom:8px">
+        ${{p.msg_limit === -1 ? 'Mensagens ilimitadas' : p.msg_limit.toLocaleString('pt-BR') + ' msgs/mês'}} ·
+        ${{p.agent_limit === -1 ? 'Agentes ilimitados' : p.agent_limit + ' agentes'}}
+      </div>
+      <ul class="plan-features">
+        ${{p.features.map(f => `<li>${{f.replace(/_/g,' ')}}</li>`).join('')}}
+      </ul>
+      ${{p.id !== currentPlan ? `<button class="btn btn-primary" style="margin-top:16px;width:100%" onclick="selectPlan('${{p.id}}');event.stopPropagation()">Assinar</button>` : '<p style="margin-top:12px;font-size:.8rem;color:#4ade80">✓ Plano ativo</p>'}}
+    </div>
+  `).join('');
+}}
+
+async function selectPlan(planId) {{
+  if ((currentStatus.plan || {{}}).id === planId) return;
+  if (!confirm(`Ativar o plano ${{planId.toUpperCase()}}?`)) return;
+  const r = await fetch(`/billing/checkout?token=${{TOKEN}}`, {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{owner_id: OWNER_ID, plan_id: planId}})
+  }});
+  const res = await r.json();
+  if (res.checkout_url) {{
+    window.location.href = res.checkout_url;
+  }} else {{
+    alert('Erro ao criar checkout: ' + (res.detail || JSON.stringify(res)));
+  }}
+}}
+
+async function cancelSub() {{
+  if (!confirm('Tem certeza que deseja cancelar a assinatura?')) return;
+  const r = await fetch(`/billing/cancel?token=${{TOKEN}}&owner_id=${{OWNER_ID}}`, {{method:'POST'}});
+  const res = await r.json();
+  if (res.status === 'canceled') {{
+    alert('Assinatura cancelada.');
+    loadStatus();
+  }} else {{
+    alert('Erro: ' + (res.detail || JSON.stringify(res)));
+  }}
+}}
+
+async function loadHistory() {{
+  if (!OWNER_ID) return;
+  const r = await fetch(`/panel/leads?token=${{TOKEN}}&owner_id=${{OWNER_ID}}&limit=1`); // just to test auth
+  // Load subscriptions history
+  const rb = await fetch(`/billing/status?token=${{TOKEN}}&owner_id=${{OWNER_ID}}`);
+  // history via direct query would need a dedicated endpoint — show placeholder
+  document.getElementById('history-area').innerHTML = `<p class="empty" style="color:#475569">Histórico de faturas disponível no portal Stripe.</p>`;
+}}
+
+function fmtDate(d) {{
+  if (!d) return '—';
+  return new Date(d).toLocaleDateString('pt-BR');
+}}
+
+// Init
+renderPlans();
+if (OWNER_ID) {{
+  loadStatus().then(loadHistory);
+}} else {{
+  document.querySelectorAll('.section').forEach(s => s.innerHTML += '<p class="empty">Informe owner_id na URL</p>');
+}}
 </script>
 </body>
 </html>"""

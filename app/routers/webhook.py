@@ -416,6 +416,18 @@ async def receive_whatsapp(request: Request):
         except Exception as e:
             logger.warning(f"[Webhook] Follow-up tracking falhou (continuando): {e}")
 
+    # ── Billing: checa limite de mensagens do plano ───────────────────────
+    if sender_phone != owner_phone:
+        try:
+            from app.middleware.billing import BillingMiddleware
+            billing = BillingMiddleware()
+            allowed = await billing.check_and_increment(owner["id"])
+            if not allowed:
+                logger.warning(f"[Billing] Limite atingido — mensagem de {message.phone} bloqueada para owner {owner['id'][:8]}")
+                return {"status": "billing_limit_reached"}
+        except Exception as _be:
+            logger.warning(f"[Billing] Erro ao verificar limite (permitindo): {_be}")
+
     # ── Rate limiting: agrupa mensagens rápidas ────────────────────────────
     buffer_key = f"buffer:{message.phone}:{owner['id']}"
     task_key = f"buffer_task:{message.phone}:{owner['id']}"

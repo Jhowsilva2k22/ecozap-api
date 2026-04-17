@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # Google OAuth (Calendar + Gmail)
     google_client_id: str = ""
     google_client_secret: str = ""
+    # Asaas — Billing (PIX + Boleto + Cartão, SaaS BR)
+    asaas_api_key: str = ""              # $aact_... (produção) ou $aasp_... (sandbox)
+    asaas_environment: str = "production"  # 'sandbox' ou 'production'
+    asaas_webhook_token: str = ""        # token para validar eventos do Asaas
 
     class Config:
         env_file = ".env"
