@@ -253,7 +253,7 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                 if mtype == "image":
                     desc = run_async(ai.respond_with_image(
                         system_prompt="Descreva esta imagem em 1-2 frases objetivas: o que é, marca, detalhes visíveis. Só a descrição, sem comentários.",
-                        history=[], user_message="Descreva esta imagem.", image_base64=b64
+                        history=[], user_message="", image_base64=b64
                     ))
                     descriptions.append(f"[Imagem {i}]: {desc}")
                 elif mtype == "audio":
@@ -285,38 +285,87 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
         raise self.retry(exc=exc)
 
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=30, queue="messages")
 @with_ops_alert("follow_up_active")
 def follow_up_active(self, phone: str, owner_id: str):
-    """Envia mensagem de follow up para usuários ativos."""
+    """Follow-up automático para lead específico que não respondeu em 5 min.
+
+    Agendado pelo webhook quando lead envia mensagem (countdown=300s).
+    Cancelado automaticamente se o lead responder antes do timeout.
+    Usa apenas database + WhatsAppService — sem dependências externas.
+    """
     try:
-        from app.services.contact import ContactService
-        from app.services.whatsapp import WhatsAppService
+        import redis as _redis_lib
+        import time as _time
         from app.database import get_db
+        from app.services.whatsapp import WhatsAppService
 
-        contact_svc = ContactService()
-        wa_svc = WhatsAppService()
+        r = _redis_lib.from_url(settings.redis_url, decode_responses=True)
 
-        active_contacts = contact_svc.find_active_today(owner_id)
-        if not active_contacts:
-            logger.info(f"[Follow-up Active] Nenhum contato ativo hoje para {owner_id}")
+        # Verifica se lead respondeu depois que a task foi agendada
+        ts_key = f"last_lead_msg:{phone}:{owner_id}"
+        fu_key = f"followup_sent:{phone}:{owner_id}"
+
+        already_sent = r.get(fu_key)
+        if already_sent:
+            logger.info(f"[Follow-up Active] Já enviado recentemente para {phone} — pulando")
             return
 
-        # Busca evolution_instance do tenant para envio correto (multi-tenant)
-        db = get_db()
-        owner_resp = db.table("tenants").select("evolution_instance").eq("id", owner_id).limit(1).execute()
-        evolution_instance = (owner_resp.data[0] if owner_resp and owner_resp.data else {}).get("evolution_instance", "")
+        last_ts = r.get(ts_key)
+        if last_ts:
+            elapsed = _time.time() - float(last_ts)
+            if elapsed < 240:  # menos de 4 min = lead acabou de responder
+                logger.info(f"[Follow-up Active] Lead {phone} respondeu há {elapsed:.0f}s — pulando")
+                return
 
-        for contact in active_contacts:
-            try:
-                msg = f"Olá {contact.first_name or contact.name}! Tudo bem? Tem algo que eu possa ajudar? 😊"
-                run_async(wa_svc.send_message(contact.phone, msg, instance=evolution_instance))
-                logger.info(f"[Follow-up Active] Enviado para {contact.phone}")
-            except Exception as e:
-                logger.error(f"[Follow-up Active] Erro ao enviar para {contact.phone}: {e}")
+        db = get_db()
+
+        # Busca dados do lead
+        customer_resp = db.table("customers").select(
+            "name, lead_status, lead_score"
+        ).eq("phone", phone).eq("owner_id", owner_id).limit(1).execute()
+
+        if not customer_resp.data:
+            logger.info(f"[Follow-up Active] Lead {phone} não encontrado — pulando")
+            return
+
+        customer = customer_resp.data[0]
+
+        # Não interrompe atendimento humano
+        if customer.get("lead_status") == "em_atendimento_humano":
+            logger.info(f"[Follow-up Active] {phone} em atendimento humano — pulando")
+            return
+
+        # Busca dados do tenant
+        owner_resp = db.table("tenants").select(
+            "evolution_instance, business_name"
+        ).eq("id", owner_id).limit(1).execute()
+
+        if not owner_resp.data:
+            logger.info(f"[Follow-up Active] Tenant {owner_id} não encontrado — pulando")
+            return
+
+        owner = owner_resp.data[0]
+        evolution_instance = owner.get("evolution_instance", "")
+
+        if not evolution_instance:
+            logger.warning(f"[Follow-up Active] Tenant {owner_id} sem evolution_instance — pulando")
+            return
+
+        # Monta mensagem de follow-up natural
+        name = customer.get("name") or ""
+        greeting = f"{name}, " if name else ""
+        msg = f"{greeting}ainda posso te ajudar com algo? 😊"
+
+        wa_svc = WhatsAppService()
+        run_async(wa_svc.send_message(phone, msg, instance=evolution_instance))
+
+        # Marca que já enviou (TTL 1h para não spam)
+        r.setex(fu_key, 3600, "1")
+        logger.info(f"[Follow-up Active] Enviado para {phone}")
 
     except Exception as exc:
-        logger.error(f"Erro no follow-up ativo para {owner_id}: {exc}")
+        logger.error(f"[Follow-up Active] Erro para {phone}: {exc}")
         raise self.retry(exc=exc)
 
 
@@ -581,21 +630,6 @@ def daily_web_search(self):
     """
     Busca autônoma diária — cada agente aprende sua especialidade.
     Roda todo dia às 6h BRT, logo após o nightly_learning_all das 3h.
-
-    Fluxo:
-      1. Lê todos os tenants ativos
-      2. Para cada tenant × cada role: chama WebSearchService.search_and_learn(role=role)
-      3. Resultados salvos no knowledge_items com tag do role:
-         [SDR: prospecção ativa WhatsApp...]
-         [Closer: técnicas fechamento vendas...]
-         [Ops/Infra: Evolution API instabilidades...]
-
-    Capacidade Brave Free (2.000 buscas/mês ≈ 66/dia):
-      7 roles × ~3 tópicos = ~21 calls/tenant/dia
-      Comporta até 3 tenants simultâneos com folga.
-
-    Requisito: BRAVE_API_KEY configurada no Railway env.
-    Sem a chave, a task executa mas não faz buscas (aviso no log).
     """
     try:
         from app.database import get_db
