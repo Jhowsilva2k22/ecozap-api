@@ -412,7 +412,7 @@ def nurture_customers(self):
                 resp = db.table("customers").select("phone, name, first_name").eq(
                     "owner_id", owner_id
                 ).eq(
-                    "lead_score", "client"
+                    "lead_status", "cliente"
                 ).limit(20).execute()
 
                 customers = resp.data or []

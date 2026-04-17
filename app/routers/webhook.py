@@ -19,18 +19,22 @@ DEDUP_TTL = 120  # segundos — janela de proteção contra duplicatas
 DEBOUNCE_SECONDS = 4  # espera 4s após última mensagem antes de responder
 
 # Comandos do DONO — todos com /prefixo
-LEARN_PREFIXES = ("/aprender ", "/aprender:", "/link ", "/link:", "/base ")
-HANDOFF_ASSUME = ("/assumir ",)
-HANDOFF_RESUME = ("/retomar ", "/devolver ")
-NOTE_PREFIX    = ("/nota ",)
-WELCOME_PREFIX = ("/bemvindo ", "/bemvindo:", "/boasvindas ", "/boasvindas:")
-CLIENT_PREFIX  = ("/cliente ",)
-STATS_CMDS     = ("/stats", "/status", "/resumo")
-REPORT_CMDS    = ("/relatorio", "/relatório", "/report")
-RECALC_CMDS    = ("/recalcular",)
-PANEL_CMDS     = ("/painel", "/panel", "/dashboard")
-GOOGLE_CMDS    = ("/conectar_google", "/google")
-CAMPAIGN_PREFIX = ("/campanha ", "/campanha:")
+LEARN_PREFIXES   = ("/aprender ", "/aprender:", "/link ", "/link:", "/base ")
+HANDOFF_ASSUME   = ("/assumir ",)
+HANDOFF_RESUME   = ("/retomar ", "/devolver ")
+NOTE_PREFIX      = ("/nota ",)
+WELCOME_PREFIX   = ("/bemvindo ", "/bemvindo:", "/boasvindas ", "/boasvindas:")
+CLIENT_PREFIX    = ("/cliente ",)
+STATS_CMDS       = ("/stats", "/status", "/resumo")
+REPORT_CMDS      = ("/relatorio", "/relatório", "/report")
+RECALC_CMDS      = ("/recalcular",)
+PANEL_CMDS       = ("/painel", "/panel", "/dashboard")
+GOOGLE_CMDS      = ("/conectar_google", "/google")
+CAMPAIGN_PREFIX  = ("/campanha ", "/campanha:")
+# ── Trainer: treinamento do atendente ──────────────────────────────────────
+TRAINER_PREFIXES = ("/treinar ", "/treinar:")
+KNOWLEDGE_CMDS   = ("/conhecimento", "/conhecimento:", "/sabe", "/oque sabe")
+FORGET_PREFIXES  = ("/esquecer ", "/esquecer:")
 
 @router.post("/webhook/whatsapp")
 async def receive_whatsapp(request: Request):
@@ -305,10 +309,50 @@ async def receive_whatsapp(request: Request):
                     await whatsapp.send_message(message.phone, "❌ Campanha cancelada.")
                     return {"status": "campaign_cancelled"}
 
+        # ── TRAINER: treinar o atendente pelo WhatsApp ───────────────────────
+        is_trainer_cmd = (
+            any(msg_lower.startswith(p) for p in TRAINER_PREFIXES)
+            or msg_lower.strip() in KNOWLEDGE_CMDS
+            or any(msg_lower.startswith(p) for p in FORGET_PREFIXES)
+        )
+        if is_trainer_cmd:
+            try:
+                from app.agents.registry import get_agent
+                from app.agents.base import AgentContext
+                trainer = get_agent("trainer")
+                if trainer:
+                    ctx = AgentContext(
+                        tenant_id=owner["id"],
+                        payload={
+                            "phone": message.phone,
+                            "owner_id": owner["id"],
+                            "message": msg_raw,
+                        },
+                    )
+                    result = await trainer.act(ctx)
+                    reply = result.get("response") or "✅ Pronto!"
+                else:
+                    reply = "⚠️ Trainer ainda está iniciando. Tente em instantes."
+            except Exception as e:
+                logger.error(f"[Webhook] Trainer falhou: {e}")
+                reply = "⚠️ Erro ao processar o comando. Tente novamente."
+            await whatsapp.send_message(message.phone, reply)
+            return {"status": "trainer_processed"}
+
         # AJUDA: lista todos os comandos disponíveis
         if msg_lower in ("/help", "/ajuda", "/comandos"):
             help_msg = (
                 "📋 *Comandos disponíveis:*\n\n"
+                "🧠 *Treinar o atendente:*\n"
+                "/treinar [texto] — ensinar algo novo ao atendente\n"
+                "/treinar [link] — extrair conhecimento de um site/página\n"
+                "/treinar faq: Pergunta → Resposta — adicionar FAQ\n"
+                "/treinar produto: X — informação sobre produto/serviço\n"
+                "/treinar objecao: X — como lidar com uma objeção\n"
+                "/treinar estilo: X — instrução de tom/estilo\n"
+                "/conhecimento — ver o que o atendente já sabe\n"
+                "/esquecer [trecho] — remover conhecimento\n\n"
+                "📊 *Gestão de leads:*\n"
                 "/stats — resumo rápido do dia\n"
                 "/relatorio — relatório semanal completo com IA\n"
                 "/recalcular — recalcula scores de todos os leads\n"
@@ -316,8 +360,8 @@ async def receive_whatsapp(request: Request):
                 "/assumir [telefone] — assumir atendimento de um lead\n"
                 "/retomar [telefone] — devolver lead pro bot\n"
                 "/cliente [telefone] — marcar como cliente\n"
-                "/nota [telefone] [texto] — anotar no perfil do lead\n"
-                "/aprender [link] — ensinar o bot com novo conteúdo\n"
+                "/nota [telefone] [texto] — anotar no perfil do lead\n\n"
+                "⚙️ *Configuração:*\n"
                 "/bemvindo [texto] — configurar mensagem de boas-vindas\n"
                 "/painel — abrir painel de gestão\n"
                 "/conectar_google — conectar Google Calendar e Gmail\n"
