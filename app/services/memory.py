@@ -84,8 +84,16 @@ class MemoryService:
         logger.info(f"[Memory] Comprimiu {len(old_ids)} msgs de {phone}")
 
     async def get_owner_context(self, owner_id: str) -> Optional[dict]:
-        result = self.db.table("owners").select("*").eq("id", owner_id).limit(1).execute()
-        return result.data[0] if result and result.data else None
+        # Lê da tabela tenants (tabela owners está obsoleta/vazia)
+        result = self.db.table("tenants").select("*").eq("id", owner_id).limit(1).execute()
+        if not result or not result.data:
+            return None
+        row = dict(result.data[0])
+        # Normaliza campos para compatibilidade com os agentes
+        row.setdefault("phone", row.get("owner_phone", ""))
+        row.setdefault("tone", row.get("bot_tone", "amigavel"))
+        row.setdefault("notify_phone", row.get("owner_phone", ""))
+        return row
 
     _GREETINGS = {
         "oi", "olá", "ola", "hey", "eae", "eai", "e ai", "e aí",
