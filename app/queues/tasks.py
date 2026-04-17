@@ -262,13 +262,7 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=30, queue="messages")
 @with_ops_alert("follow_up_active")
 def follow_up_active(self, phone: str, owner_id: str):
-    """Follow-up de conversa ativa — cliente silenciou no meio de uma troca.
-
-    Aciona 5 min após a última mensagem do lead.
-    Gera pergunta contextual via IA baseada nos últimos turnos da conversa.
-    NÃO usa nome do cliente para evitar erros de cadastro.
-    Cancelado automaticamente se o lead responder antes do timeout.
-    """
+    """Follow-up de conversa ativa — cliente silenciou no meio de uma troca."""
     try:
         import redis as _redis_lib
         import time as _time
@@ -308,7 +302,6 @@ def follow_up_active(self, phone: str, owner_id: str):
             logger.info(f"[Follow-up Active] {phone} em atendimento humano — pulando")
             return
 
-        # Colunas reais de tenants: context_summary, bot_tone, business_name
         owner_resp = db.table("tenants").select(
             "evolution_instance, business_name, context_summary, bot_tone"
         ).eq("id", owner_id).limit(1).execute()
@@ -324,7 +317,6 @@ def follow_up_active(self, phone: str, owner_id: str):
             logger.warning(f"[Follow-up Active] Tenant {owner_id} sem evolution_instance — pulando")
             return
 
-        # Busca histórico recente para contextualizar a mensagem
         history = []
         try:
             msgs_resp = db.table("messages").select(
@@ -351,12 +343,7 @@ def follow_up_active(self, phone: str, owner_id: str):
 
 
 def _generate_active_followup(customer: dict, owner: dict, history: list) -> str:
-    """Gera mensagem de follow-up contextual para conversa ativa.
-
-    Usa os últimos turnos da conversa para gerar uma pergunta natural:
-    'ficou alguma dúvida?', 'ainda está por aí?', ou algo específico
-    sobre o assunto discutido. Fallback genérico sem nome se IA falhar.
-    """
+    """Gera mensagem de follow-up contextual para conversa ativa."""
     try:
         from app.services.ai import AIService
 
@@ -410,17 +397,15 @@ def _generate_active_followup(customer: dict, owner: dict, history: list) -> str
     return "ainda posso te ajudar com algo? 😊"
 
 
-# ─────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 # CONFIGURAÇÃO DOS ESTÁGIOS DE FOLLOW-UP FRIO
-# ─────────────────────────────────────────────────────────────────────────
-# Estágio: (dias_desde_last_contact, cooldown_desde_last_nurture, é_final)
+# -------------------------------------------------------------------------
 _COLD_STAGES = {
-    0: {"contact_days": 3,  "nurture_cooldown_days": 3,  "final": False},  # 1º toque: dúvidas da conversa
-    1: {"contact_days": 7,  "nurture_cooldown_days": 4,  "final": False},  # 2º toque: valor/disponibilidade
-    2: {"contact_days": 15, "nurture_cooldown_days": 7,  "final": True},   # 3º toque: encerramento gentil
+    0: {"contact_days": 3,  "nurture_cooldown_days": 3,  "final": False},
+    1: {"contact_days": 7,  "nurture_cooldown_days": 4,  "final": False},
+    2: {"contact_days": 15, "nurture_cooldown_days": 7,  "final": True},
 }
 
-# Mensagens fallback por estágio (quando IA falha ou sem contexto)
 _COLD_FALLBACKS = {
     0: "oi! vi que conversamos há alguns dias — ficou com alguma dúvida? 😊",
     1: "ainda posso te ajudar? tenho disponibilidade pra conversar quando quiser.",
@@ -431,27 +416,19 @@ _COLD_FALLBACKS = {
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 @with_ops_alert("follow_up_cold_leads")
 def follow_up_cold_leads(self):
-    """Follow-up de leads frios em 3 estágios progressivos.
-
-    Estágio 0 → 1 (3 dias):  leve, verifica dúvidas da conversa anterior
-    Estágio 1 → 2 (7 dias):  direto, ângulo de valor/disponibilidade
-    Estágio 2 → 3 (15 dias): encerramento gentil, porta aberta
-    Após estágio 3: nurture_paused=True — ciclo encerrado
-
-    Reinicia automaticamente quando cliente responde
-    (webhook já reseta follow_up_stage=0 e nurture_paused=False).
-    """
+    """Follow-up de leads frios em 3 estágios progressivos."""
     try:
         from app.database import get_db
         from app.services.whatsapp import WhatsAppService
         from app.services.ai import AIService
         from app.services.ops import save_progress, get_progress, clear_progress
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
 
         db = get_db()
         wa_svc = WhatsAppService()
         ai_svc = AIService()
-        now = datetime.utcnow()
+        # Usa timezone-aware UTC para comparar corretamente com timestamps do Supabase
+        now = datetime.now(timezone.utc)
 
         progress = get_progress("follow_up_cold_leads")
         processed_owners = set(progress.get("done", [])) if progress else set()
@@ -484,7 +461,6 @@ def follow_up_cold_leads(self):
             try:
                 sent_count = 0
 
-                # Itera cada estágio separadamente
                 for stage, cfg in _COLD_STAGES.items():
                     contact_threshold = now - timedelta(days=cfg["contact_days"])
                     nurture_cooldown = now - timedelta(days=cfg["nurture_cooldown_days"])
@@ -513,10 +489,9 @@ def follow_up_cold_leads(self):
                             try:
                                 ln_str = str(last_nurture).replace("Z", "+00:00")
                                 ln_dt = datetime.fromisoformat(ln_str)
-                                # Remove timezone para comparar com utcnow
-                                if ln_dt.tzinfo is not None:
-                                    from datetime import timezone
-                                    ln_dt = ln_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                                # Garante que ln_dt é tz-aware para comparar com nurture_cooldown
+                                if ln_dt.tzinfo is None:
+                                    ln_dt = ln_dt.replace(tzinfo=timezone.utc)
                                 if ln_dt > nurture_cooldown:
                                     continue  # enviado recente demais
                             except Exception:
@@ -538,7 +513,6 @@ def follow_up_cold_leads(self):
                                 lead["phone"], msg, instance=evolution_instance
                             ))
 
-                            # Avança estágio e registra data
                             new_stage = stage + 1
                             update_data = {
                                 "follow_up_stage": new_stage,
@@ -587,13 +561,7 @@ def follow_up_cold_leads(self):
 
 
 def _generate_cold_followup(stage: int, lead: dict, owner: dict, ai_svc) -> str:
-    """Gera mensagem de reengajamento por estágio.
-
-    Estágio 0: leve, verifica dúvidas da conversa anterior
-    Estágio 1: direto, ângulo de valor/disponibilidade
-    Estágio 2: encerramento gentil, porta aberta
-    Fallback hardcoded por estágio se IA falhar.
-    """
+    """Gera mensagem de reengajamento por estágio."""
     summary = lead.get("summary") or ""
     context_summary = owner.get("context_summary") or ""
     bot_tone = owner.get("bot_tone") or "amigável e direto"
@@ -619,7 +587,6 @@ def _generate_cold_followup(stage: int, lead: dict, owner: dict, ai_svc) -> str:
 
     instruction = stage_instructions.get(stage, stage_instructions[2])
 
-    # Tenta gerar via IA se tiver contexto
     if summary or context_summary:
         try:
             system = (
@@ -644,7 +611,6 @@ def _generate_cold_followup(stage: int, lead: dict, owner: dict, ai_svc) -> str:
             ))
 
             if result and len(result.strip()) > 3:
-                # Estágio final não usa nome (encerramento impessoal funciona melhor)
                 if name and stage < 2:
                     return f"{name}, {result.strip()}"
                 return result.strip()
@@ -652,7 +618,6 @@ def _generate_cold_followup(stage: int, lead: dict, owner: dict, ai_svc) -> str:
         except Exception as e:
             logger.warning(f"[Follow-up Cold] IA falhou no stage {stage}: {e}")
 
-    # Fallback hardcoded por estágio
     fallback = _COLD_FALLBACKS.get(stage, _COLD_FALLBACKS[2])
     if name and stage < 2:
         return f"{name}, {fallback}"
