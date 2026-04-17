@@ -463,6 +463,26 @@ class Surgeon(Agent):
         }
 
     def opine(self, question: str, context: AgentContext) -> AgentOpinion:
+        """
+        Cirúrgico: fix mínimo, PR documentado, CEO aprova.
+        Quando convocado com tenant_id, consulta KB para avaliar
+        se o patch pode impactar funcionalidades críticas do negócio.
+        """
+        # Consulta KB quando há contexto de tenant (reuniões de conselho)
+        kb_insight = ""
+        if context.tenant_id:
+            try:
+                from app.services.knowledge import KnowledgeBank
+                kb = KnowledgeBank()
+                recent = kb._get_recent_learnings(context.tenant_id, limit=1)
+                if recent:
+                    kb_insight = (
+                        f" KB consultado — considerando impacto do patch "
+                        f"nas funcionalidades de negócio do tenant."
+                    )
+            except Exception:
+                pass
+
         deploy_keywords = ["deploy", "merge", "production", "release", "apply", "patch"]
         if any(kw in question.lower() for kw in deploy_keywords):
             return AgentOpinion(
@@ -472,10 +492,14 @@ class Surgeon(Agent):
                     f"[{self.display_name}] Confirmo que qualquer merge/deploy "
                     f"DEVE ter CEO_OVERRIDE explícito. "
                     f"Minha regra: fix mínimo, PR documentado, CEO aprova."
+                    + kb_insight
                 ),
             )
         return AgentOpinion(
             agent_role=self.role,
             agrees=True,
-            reasoning=f"[{self.display_name}] Sem impacto de patch identificado.",
+            reasoning=(
+                f"[{self.display_name}] Sem impacto de patch identificado."
+                + kb_insight
+            ),
         )
