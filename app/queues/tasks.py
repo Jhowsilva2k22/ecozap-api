@@ -288,11 +288,13 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=30, queue="messages")
 @with_ops_alert("follow_up_active")
 def follow_up_active(self, phone: str, owner_id: str):
-    """Follow-up automático para lead específico que não respondeu em 5 min.
+    """Follow-up de conversa ativa — cliente silenciou no meio de uma troca.
 
-    Agendado pelo webhook quando lead envia mensagem (countdown=300s).
+    Aciona 5 min após a última mensagem do lead.
+    Gera uma pergunta contextual via IA ("ficou alguma dúvida?",
+    "ainda está por aí?", etc.) baseada nos últimos turnos da conversa.
+    NÃO usa nome do cliente para evitar erros de cadastro.
     Cancelado automaticamente se o lead responder antes do timeout.
-    Usa apenas database + WhatsAppService — sem dependências externas.
     """
     try:
         import redis as _redis_lib
@@ -320,9 +322,9 @@ def follow_up_active(self, phone: str, owner_id: str):
 
         db = get_db()
 
-        # Busca dados do lead
+        # Busca dados do lead (inclui summary para contexto)
         customer_resp = db.table("customers").select(
-            "name, lead_status, lead_score"
+            "name, lead_status, lead_score, summary"
         ).eq("phone", phone).eq("owner_id", owner_id).limit(1).execute()
 
         if not customer_resp.data:
@@ -338,7 +340,7 @@ def follow_up_active(self, phone: str, owner_id: str):
 
         # Busca dados do tenant
         owner_resp = db.table("tenants").select(
-            "evolution_instance, business_name"
+            "evolution_instance, business_name, context_summary, main_offer"
         ).eq("id", owner_id).limit(1).execute()
 
         if not owner_resp.data:
@@ -352,21 +354,100 @@ def follow_up_active(self, phone: str, owner_id: str):
             logger.warning(f"[Follow-up Active] Tenant {owner_id} sem evolution_instance — pulando")
             return
 
-        # Monta mensagem de follow-up natural
-        name = customer.get("name") or ""
-        greeting = f"{name}, " if name else ""
-        msg = f"{greeting}ainda posso te ajudar com algo? 😊"
+        # Busca histórico recente para gerar mensagem contextual
+        history = []
+        try:
+            msgs_resp = db.table("messages").select(
+                "role, content"
+            ).eq("phone", phone).eq("owner_id", owner_id).order(
+                "created_at", desc=True
+            ).limit(6).execute()
+            if msgs_resp.data:
+                history = list(reversed(msgs_resp.data))
+        except Exception as e:
+            logger.warning(f"[Follow-up Active] Erro ao buscar histórico de {phone}: {e}")
+
+        # Gera mensagem contextual via IA (sem nome, evita erros de cadastro)
+        msg = _generate_active_followup(customer, owner, history)
 
         wa_svc = WhatsAppService()
         run_async(wa_svc.send_message(phone, msg, instance=evolution_instance))
 
         # Marca que já enviou (TTL 1h para não spam)
         r.setex(fu_key, 3600, "1")
-        logger.info(f"[Follow-up Active] Enviado para {phone}")
+        logger.info(f"[Follow-up Active] Enviado para {phone}: '{msg[:60]}'")
 
     except Exception as exc:
         logger.error(f"[Follow-up Active] Erro para {phone}: {exc}")
         raise self.retry(exc=exc)
+
+
+def _generate_active_followup(customer: dict, owner: dict, history: list) -> str:
+    """Gera mensagem de follow-up contextual via IA.
+
+    Analisa os últimos turnos da conversa e produz uma frase natural
+    para retomar o contato: "ficou alguma dúvida?", "ainda está por aí?",
+    ou algo específico sobre o assunto que estava sendo discutido.
+    Fallback para mensagem genérica se a IA falhar.
+    """
+    try:
+        from app.services.ai import AIService
+
+        summary = customer.get("summary") or ""
+        main_offer = owner.get("main_offer") or ""
+        context_summary = owner.get("context_summary") or ""
+
+        # Monta trecho da conversa para dar contexto à IA
+        context_lines = []
+        for m in history[-4:]:  # últimas 4 mensagens
+            role = "Cliente" if m.get("role") == "user" else "Atendente"
+            content = (m.get("content") or "")[:120].replace("\n", " ")
+            context_lines.append(f"{role}: {content}")
+        context_text = "\n".join(context_lines)
+
+        # Sem nenhum histórico nem resumo → mensagem genérica simples
+        if not context_text and not summary:
+            return "ainda posso te ajudar com algo? 😊"
+
+        system = (
+            "Você é um atendente de WhatsApp humanizado. "
+            "O cliente ficou em silêncio no meio de uma conversa. "
+            "Gere UMA mensagem curta (máximo 2 frases) para retomar o contato de forma natural — "
+            "como um humano faria, sem soar robótico. "
+            "Use o contexto da conversa: se foi falado de um produto específico, pergunte sobre ele. "
+            "Exemplos de tom: 'ficou alguma dúvida?', 'ainda está por aí? 😊', "
+            "'posso te ajudar com mais alguma coisa?', 'me fala se tiver dúvida!'. "
+            "REGRAS: NÃO use o nome do cliente. NÃO invente informações. "
+            "NÃO comece com saudação (sem oi, olá). "
+            "Responda APENAS a mensagem pronta, sem aspas, sem explicação."
+        )
+
+        user_msg_parts = []
+        if context_text:
+            user_msg_parts.append(f"Trecho da conversa:\n{context_text}")
+        if summary:
+            user_msg_parts.append(f"Resumo do cliente: {summary[:200]}")
+        if main_offer:
+            user_msg_parts.append(f"Produto/serviço em pauta: {main_offer[:100]}")
+        user_msg_parts.append("Gere a mensagem de follow-up:")
+
+        user_msg = "\n\n".join(user_msg_parts)
+
+        ai = AIService()
+        result = run_async(ai.respond(
+            system_prompt=system,
+            history=[],
+            user_message=user_msg
+        ))
+
+        if result and len(result.strip()) > 3:
+            return result.strip()
+
+    except Exception as e:
+        logger.warning(f"[Follow-up Active] IA falhou ao gerar mensagem contextual: {e}")
+
+    # Fallback: mensagem genérica sem nome
+    return "ainda posso te ajudar com algo? 😊"
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
