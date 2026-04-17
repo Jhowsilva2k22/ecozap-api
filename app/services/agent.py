@@ -66,27 +66,29 @@ class AgentService:
         logger.info("[AgentService] Roteando para agente: %s", agent_role)
 
         # 4. Processa via QualifierAgent (motor compartilhado)
-        #    O agent_mode influencia o prompt e comportamento
-        effective_mode = self._effective_mode(agent_role, agent_mode)
-
         try:
             from app.agents.qualifier import QualifierAgent
             qualifier = QualifierAgent()
-            result = await qualifier.process(
+            # NOTA: qualifier.process() não aceita agent_mode — não passar
+            await qualifier.process(
                 phone=phone,
                 owner_id=self.owner_id,
                 message=message,
-                agent_mode=effective_mode,
                 message_id=message_id,
                 media_type=media_type,
             )
         except Exception as e:
-            logger.error("[AgentService] QualifierAgent falhou: %s", e)
+            logger.error("[AgentService] QualifierAgent falhou: %s", e, exc_info=True)
             return {"status": "error", "error": str(e), "agent": agent_role}
 
-        # 5. Pós-processamento baseado no agente
-        new_score = result.get("lead_score", lead_score)
-        new_status = result.get("lead_status", lead_status)
+        # 5. Pós-processamento — busca estado atualizado do banco
+        try:
+            updated_state = await self._get_customer_state(phone)
+            new_score = updated_state.get("lead_score", lead_score)
+            new_status = updated_state.get("lead_status", lead_status)
+        except Exception:
+            new_score = lead_score
+            new_status = lead_status
 
         await self._post_process(
             agent_role=agent_role,
