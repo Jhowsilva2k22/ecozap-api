@@ -10,6 +10,7 @@ O que guarda:
 - Extrações de links enviados pelo owner
 - Aprendizados do nightly_learning
 - Expertise e linguagem do dono
+- Aprendizados diários do web_search (tendências de mercado)
 
 Regra de ouro: o atendente NUNCA inventa.
 Se não encontrar no knowledge bank → admite que vai verificar.
@@ -39,7 +40,7 @@ CATEGORY_EXPERTISE   = "expertise"     # conhecimento técnico/especialidade do 
 CATEGORY_COMPETITOR  = "concorrente"   # diferencial vs concorrentes
 CATEGORY_TESTIMONIAL = "depoimento"    # casos de sucesso, provas sociais
 CATEGORY_PROCESS     = "processo"      # como funciona a contratação, onboarding
-CATEGORY_LEARNING    = "aprendizado"   # extraído do nightly_learning
+CATEGORY_LEARNING    = "aprendizado"   # extraído do nightly_learning e web_search
 
 
 class KnowledgeBank:
@@ -93,6 +94,78 @@ class KnowledgeBank:
             return {"ok": True, "id": result.data[0]["id"] if result.data else None}
         except Exception as e:
             logger.warning("[Knowledge] Falha ao salvar item: %s", e)
+            return {"ok": False, "reason": str(e)}
+
+    def upsert_topic_item(
+        self,
+        owner_id: str,
+        topic: str,
+        content: str,
+        source: str = "web_search",
+        confidence: float = 0.7,
+    ) -> dict:
+        """
+        Atualiza ou cria um item de conhecimento identificado por tópico.
+
+        Busca entrada existente com o mesmo source prefix e marcador de tópico
+        no conteúdo. Se encontrar → ATUALIZA (content, source, confidence,
+        created_at). Se não encontrar → INSERE novo item.
+
+        Isso evita o acúmulo infinito de entradas obsoletas sobre o mesmo tema.
+        Use para conteúdo periódico como buscas web semanais.
+        """
+        content = content.strip()
+        if not content or len(content) < 10:
+            return {"ok": False, "reason": "content too short"}
+
+        # Extrai prefixo do source para matching
+        # ex: "web_search | url1 | url2"  →  "web_search"
+        source_prefix = source.split(" |")[0].strip()
+
+        # Os primeiros 60 chars do tópico como chave de busca no conteúdo
+        topic_marker = topic[:60]
+
+        try:
+            existing = self.db.table("knowledge_items") \
+                .select("id") \
+                .eq("owner_id", owner_id) \
+                .ilike("source", f"{source_prefix}%") \
+                .ilike("content", f"%{topic_marker}%") \
+                .limit(1) \
+                .execute()
+
+            if existing.data:
+                item_id = existing.data[0]["id"]
+                self.db.table("knowledge_items").update({
+                    "content": content,
+                    "source": source,
+                    "confidence": confidence,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", item_id).execute()
+                return {"ok": True, "id": item_id, "action": "updated"}
+
+        except Exception as e:
+            logger.warning("[Knowledge] Falha ao buscar para upsert: %s", e)
+
+        # Não encontrou — insere como novo
+        item = {
+            "owner_id": owner_id,
+            "category": CATEGORY_LEARNING,
+            "content": content,
+            "source": source,
+            "confidence": confidence,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "times_used": 0,
+        }
+        try:
+            result = self.db.table("knowledge_items").insert(item).execute()
+            return {
+                "ok": True,
+                "id": result.data[0]["id"] if result.data else None,
+                "action": "created",
+            }
+        except Exception as e:
+            logger.warning("[Knowledge] Falha ao inserir item: %s", e)
             return {"ok": False, "reason": str(e)}
 
     def add_many(self, owner_id: str, items: list[dict]) -> int:
@@ -163,12 +236,28 @@ class KnowledgeBank:
     def get_context_for_prompt(self, owner_id: str, query: str = "", limit: int = 8) -> str:
         """
         Retorna bloco de conhecimento formatado para inserir no prompt.
-        Se query vazia, retorna os mais usados/confiáveis.
+
+        Sempre inclui os aprendizados recentes da categoria 'aprendizado'
+        (gerados pelo web_search diário), independente da query.
+        Isso garante que TODOS os agentes — qualifier, attendant, SDR, Closer,
+        Consultant — recebam contexto atualizado de tendências de mercado.
+
+        Se query vazia, retorna os mais usados/confiáveis + aprendizados recentes.
         """
+        # Reserva 2 slots para aprendizados recentes (web search)
+        base_limit = max(limit - 2, 3)
+
         if query:
-            items = self.search(owner_id, query, limit)
+            items = self.search(owner_id, query, base_limit)
         else:
-            items = self._get_top_items(owner_id, limit)
+            items = self._get_top_items(owner_id, base_limit)
+
+        # Sempre injeta aprendizados recentes — disponíveis para todos os agentes
+        recent_learnings = self._get_recent_learnings(owner_id, limit=2)
+        seen_ids = {item["id"] for item in items}
+        for learning in recent_learnings:
+            if learning["id"] not in seen_ids:
+                items.append(learning)
 
         if not items:
             return ""
@@ -356,6 +445,24 @@ class KnowledgeBank:
                 .eq("owner_id", owner_id)\
                 .order("times_used", desc=True)\
                 .limit(limit)\
+                .execute()
+            return resp.data or []
+        except Exception:
+            return []
+
+    def _get_recent_learnings(self, owner_id: str, limit: int = 2) -> list[dict]:
+        """
+        Retorna os aprendizados mais recentes da categoria 'aprendizado'.
+        Inclui tanto os gerados pelo web_search quanto pelo nightly_learning.
+        Ordenados por data de criação decrescente — sempre o mais fresco primeiro.
+        """
+        try:
+            resp = self.db.table("knowledge_items") \
+                .select("id, category, content, confidence, times_used") \
+                .eq("owner_id", owner_id) \
+                .eq("category", CATEGORY_LEARNING) \
+                .order("created_at", desc=True) \
+                .limit(limit) \
                 .execute()
             return resp.data or []
         except Exception:
