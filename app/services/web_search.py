@@ -8,7 +8,8 @@ Fluxo:
   1. Recebe lista de tópicos (ou usa DEFAULT_TOPICS)
   2. Busca cada tópico na Brave Search (últimos 7 dias, pt-BR)
   3. Resume top resultados com Claude Haiku (barato e rápido)
-  4. Salva no knowledge_items com category="aprendizado"
+  4. Upsert no knowledge_items: ATUALIZA se tópico já existe, CRIA se novo
+     → Nunca acumula entradas obsoletas sobre o mesmo tema
 
 Requisito: BRAVE_API_KEY no Railway env
   → https://api.search.brave.com (plano Free: 2.000 buscas/mês)
@@ -146,8 +147,15 @@ class WebSearchService:
         topics: Optional[list[str]] = None,
     ) -> int:
         """
-        Executa o ciclo completo: busca → resume → salva no KnowledgeBank.
-        Retorna o número de insights salvos.
+        Executa o ciclo completo: busca → resume → upsert no KnowledgeBank.
+
+        Usa upsert_topic_item() em vez de add_item():
+        - Se o tópico já existir no banco → ATUALIZA conteúdo e data
+        - Se não existir → CRIA nova entrada
+        Isso mantém o banco sempre com exatamente 1 entrada por tópico,
+        sempre com a versão mais recente — sem acúmulo infinito.
+
+        Retorna o número de tópicos salvos/atualizados.
         """
         kb = KnowledgeBank()
         topics_to_search = topics or DEFAULT_TOPICS
@@ -175,9 +183,9 @@ class WebSearchService:
                     r["url"] for r in results[:3] if r.get("url")
                 )
 
-                result = kb.add_item(
+                result = kb.upsert_topic_item(
                     owner_id=owner_id,
-                    category="aprendizado",
+                    topic=topic,
                     content=content,
                     source=f"web_search | {source_urls[:180]}",
                     confidence=0.7,
@@ -185,17 +193,24 @@ class WebSearchService:
 
                 if result.get("ok"):
                     saved += 1
-                    logger.info("[WebSearch] ✓ Salvo: '%s'", topic[:60])
+                    action = result.get("action", "salvo")  # "updated" ou "created"
+                    logger.info(
+                        "[WebSearch] ✓ %s: '%s'",
+                        "Atualizado" if action == "updated" else "Criado",
+                        topic[:60],
+                    )
                 else:
-                    reason = result.get("reason", "")
-                    if reason != "duplicate":
-                        logger.warning("[WebSearch] Não salvo ('%s'): %s", topic[:40], reason)
+                    logger.warning(
+                        "[WebSearch] Não salvo ('%s'): %s",
+                        topic[:40],
+                        result.get("reason", "?"),
+                    )
 
             except Exception as e:
                 logger.error("[WebSearch] Erro no tópico '%s': %s", topic, e)
 
         logger.info(
-            "[WebSearch] Concluído para tenant %s — %d/%d insights salvos",
+            "[WebSearch] Concluído para tenant %s — %d/%d tópicos processados",
             owner_id[:8],
             saved,
             len(topics_to_search),
