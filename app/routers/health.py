@@ -1,6 +1,7 @@
 """
 Health checks reais.
-- /health/live  : servidor de pé, sem I/O (pra ping barato)
+- /health       : alias leve (pra ping barato e Sentinel)
+- /health/live  : servidor de pé, sem I/O
 - /health/ready : checa Redis, Supabase, Evolution, Meta
 """
 import os
@@ -25,8 +26,10 @@ META_TOKEN = os.getenv("META_PAGE_TOKEN", "")
 META_PAGE_ID = os.getenv("META_PAGE_ID", "")
 
 
+@router.get("/health")
 @router.get("/health/live")
 def live():
+    """Ping leve — sem I/O. Usado pelo Sentinel e uptime monitors."""
     return {"status": "ok", "ts": int(time.time())}
 
 

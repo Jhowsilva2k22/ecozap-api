@@ -111,12 +111,14 @@ class MemoryService:
         return row
 
     _GREETINGS = {
+        # Saudações
         "oi", "olá", "ola", "hey", "eae", "eai", "e ai", "e aí",
         "boa noite", "boa tarde", "bom dia", "boa madrugada",
         "oi boa noite", "oi boa tarde", "oi bom dia",
         "olá boa noite", "olá boa tarde", "olá bom dia",
         "ola boa noite", "ola boa tarde", "ola bom dia",
         "oie", "oii", "oiii", "opa", "fala", "salve",
+        # Agradecimentos / confirmações
         "obrigado", "obrigada", "vlw", "valeu", "brigado", "brigada",
         "ok", "tá", "ta", "sim", "não", "nao", "beleza", "blz",
         "tudo bem", "tudo bom", "td bem", "td bom",
@@ -124,6 +126,27 @@ class MemoryService:
         "tchau", "até mais", "ate mais", "flw", "falou",
         "oi tudo bem", "oi tudo bom", "olá tudo bem",
         "boas", "noite", "tarde", "dia",
+        # Slang BR — tratamentos e expressões que NÃO são nomes reais
+        "voa", "bora", "tmj", "tamo junto", "tamô junto",
+        "cara", "mano", "irmao", "irmão", "brother", "bro",
+        "brabo", "brabão", "brabao",
+        "véi", "vei", "véio", "veio",
+        "parça", "parca", "parceiro", "parceira",
+        "chefe", "chefia", "patrão", "patrao", "patroa",
+        "mlk", "moleque",
+        "pow", "poxa", "putz", "eita", "xi",
+        "fechou", "combinado", "firmeza", "firmão", "firmao",
+        "meu", "minha",
+        "presente",
+        "eu",
+        "tamo", "tamô",
+        "aqui",
+        "nada",
+        "haha", "hehe", "kk", "kkk", "kkkk", "rsrs", "hahaha",
+        "né", "ne", "né não", "ne nao",
+        "certo", "claro", "exato", "isso", "exatamente",
+        "pode", "pode ser", "tá bom", "ta bom", "tá ótimo",
+        "perfeito", "ótimo", "otimo", "maravilha", "incrível", "incrivel",
     }
 
     _NAME_REQUEST_KEYWORDS = {
