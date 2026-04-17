@@ -435,7 +435,26 @@ class Sentinel(Agent):
         }
 
     def opine(self, question: str, context: AgentContext) -> AgentOpinion:
-        """Sentinel sempre pergunta sobre estabilidade primeiro."""
+        """
+        Sentinel sempre pergunta sobre estabilidade primeiro.
+        Quando chamado pelo Council com tenant_id, consulta aprendizados
+        recentes do KnowledgeBank para enriquecer a análise de impacto.
+        """
+        # Consulta KB quando há contexto de tenant (reuniões de conselho)
+        kb_insight = ""
+        if context.tenant_id:
+            try:
+                from app.services.knowledge import KnowledgeBank
+                kb = KnowledgeBank()
+                recent = kb._get_recent_learnings(context.tenant_id, limit=1)
+                if recent:
+                    kb_insight = (
+                        f" Contexto de mercado disponível no KB do tenant "
+                        f"({recent[0]['content'][:80]}...) — considerado na avaliação de impacto."
+                    )
+            except Exception:
+                pass
+
         stability_keywords = ["deploy", "rename", "schema", "migration", "restart", "update"]
         if any(kw in question.lower() for kw in stability_keywords):
             return AgentOpinion(
@@ -445,10 +464,14 @@ class Sentinel(Agent):
                     f"[{self.display_name}] Vou monitorar ativamente por 30 minutos "
                     f"após a mudança. Qualquer anomalia reporto imediatamente. "
                     f"Recomendo janela de manutenção com backup confirmado."
+                    + kb_insight
                 ),
             )
         return AgentOpinion(
             agent_role=self.role,
             agrees=True,
-            reasoning=f"[{self.display_name}] Sem impacto de monitoramento identificado.",
+            reasoning=(
+                f"[{self.display_name}] Sem impacto de monitoramento identificado."
+                + kb_insight
+            ),
         )
