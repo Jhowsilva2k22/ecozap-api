@@ -114,7 +114,7 @@ async def receive_whatsapp(request: Request):
             welcome_text = _extract_after_prefix(msg_raw, WELCOME_PREFIX)
             if welcome_text:
                 try:
-                    memory.db.table("owners").update({"welcome_message": welcome_text}).eq("id", owner["id"]).execute()
+                    memory.db.table("tenants").update({"welcome_message": welcome_text}).eq("id", owner["id"]).execute()
                     await whatsapp.send_message(
                         message.phone,
                         f"✅ Mensagem de boas-vindas atualizada!\n\n"
@@ -126,8 +126,7 @@ async def receive_whatsapp(request: Request):
                     logger.error(f"[Webhook] Erro ao salvar welcome: {e}")
                     await whatsapp.send_message(
                         message.phone,
-                        "⚠️ Erro ao salvar. Rode no Supabase:\n"
-                        "ALTER TABLE owners ADD COLUMN welcome_message TEXT DEFAULT '';",
+                        "⚠️ Erro ao salvar. Tente novamente.",
                         instance=evolution_instance
                     )
                 return {"status": "welcome_updated"}
@@ -614,9 +613,20 @@ def _is_next_day(last_contact) -> bool:
 # ── Helpers de parsing ────────────────────────────────────────────────────────
 
 async def _get_owner_by_instance(instance: str):
+    """Busca o tenant pelo evolution_instance.
+    Lê da tabela 'tenants' (a tabela 'owners' está obsoleta/vazia).
+    Normaliza os campos para compatibilidade com o restante do código.
+    """
     db = memory.db
-    result = db.table("owners").select("*").eq("evolution_instance", instance).maybe_single().execute()
-    return result.data if result and result.data else None
+    result = db.table("tenants").select("*").eq("evolution_instance", instance).limit(1).execute()
+    if not result or not result.data:
+        return None
+    row = dict(result.data[0])
+    # Normaliza campos para compatibilidade com o restante do código
+    row.setdefault("phone", row.get("owner_phone", ""))
+    row.setdefault("tone", row.get("bot_tone", "amigavel"))
+    row.setdefault("notify_phone", row.get("owner_phone", ""))
+    return row
 
 
 def _normalize_phone(phone: str) -> str:
