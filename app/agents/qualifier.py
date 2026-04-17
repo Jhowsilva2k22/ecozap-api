@@ -27,6 +27,53 @@ def _detect_channel(message: str) -> str:
             return channel
     return ""
 
+
+# ─── Busca web em tempo real ───────────────────────────────────────────
+# Detecta @handles e URLs — qualquer coisa que exige dados externos em tempo real
+_WEB_SEARCH_PAT = re.compile(
+    r'@([\w.]{2,30})|https?://\S+',
+    re.IGNORECASE,
+)
+
+
+def _detect_web_search_need(message: str):
+    """Retorna (precisa_busca: bool, query: str)."""
+    m = _WEB_SEARCH_PAT.search(message.strip())
+    if not m:
+        return False, ""
+    full = m.group(0)
+    if full.startswith("@"):
+        handle = m.group(1)
+        return True, f'"{handle}" Instagram perfil bio negócio informações'
+    # URL — busca informações sobre o domínio/site
+    domain = re.sub(r'https?://(www\.)?', '', full).split('/')[0]
+    return True, f'site "{domain}" o que é informações sobre'
+
+
+async def _fetch_web_context(query: str) -> str:
+    """Busca web síncrona via asyncio.to_thread. Retorna snippets formatados."""
+    import asyncio as _asyncio
+    try:
+        from app.services.web_search import WebSearchService
+        svc = WebSearchService()
+        results = await _asyncio.to_thread(svc._search_brave, query, 5)
+        if not results:
+            return ""
+        lines = []
+        for r in results[:5]:
+            title = r.get("title", "")
+            desc = r.get("description", "")
+            url = r.get("url", "")
+            line = f"• {title}: {desc}"
+            if url:
+                line += f" ({url})"
+            lines.append(line)
+        return "\n".join(lines)
+    except Exception as _e:
+        logger.warning("[Qualifier] Web search falhou: %s", _e)
+        return ""
+
+
 def build_qualifier_prompt(owner: dict, customer: dict, history_summary: str, knowledge_context: str = "") -> str:
     name = owner.get("business_name", "a empresa")
     tone = owner.get("tone", "acolhedor e direto")
@@ -58,7 +105,6 @@ def build_qualifier_prompt(owner: dict, customer: dict, history_summary: str, kn
 
     knowledge_block = f"\n━━ CONHECIMENTO TREINADO ━━\nUse isso nas respostas quando relevante. Nunca invente o que não está aqui.\n{knowledge_context}" if knowledge_context else ""
 
-    # Instruções personalizadas do dono (bot_prompt no Supabase)
     bot_prompt = owner.get("bot_prompt") or ""
     custom_block = f"\n\n━━ ESTILO PERSONALIZADO ━━\n{bot_prompt}" if bot_prompt else ""
 
@@ -138,19 +184,11 @@ class QualifierAgent:
         if not owner:
             return
 
-        # ── Instância Evolution correta para este owner (multi-tenant) ──────
         evolution_instance = owner.get("evolution_instance") or ""
-
-        # Canal do lead (whatsapp ou instagram)
         ch = customer.channel or "whatsapp"
 
-        # Carrega histórico ANTES da verificação de primeiro contato
-        # Evita disparar welcome_message se total_messages ficou zerado por falha de PATCH
         history = await self.memory.get_conversation_history(phone, owner_id)
 
-        # ── Boas-vindas no primeiro contato ─────────────────────────────────
-        # Primeiro contato REAL: sem mensagens no histórico E total_messages == 0
-        # Antes: só verificava total_messages → welcome disparava de novo se PATCH falhasse
         is_first_contact = (customer.total_messages or 0) == 0 and len(history) == 0
         welcome_msg = (owner.get("welcome_message") or "")
         if is_first_contact and welcome_msg:
@@ -160,7 +198,6 @@ class QualifierAgent:
             await sender.send_message(phone, final_welcome, channel=ch, instance=evolution_instance)
             await self.memory.save_turn(phone, owner_id, "assistant", final_welcome)
 
-        # ── Knowledge Bank: contexto de conhecimento treinado ───────────────
         knowledge_context = ""
         try:
             from app.services.knowledge import KnowledgeBank
@@ -169,12 +206,9 @@ class QualifierAgent:
         except Exception as _ke:
             pass
 
-        # ── Processa mídia ──────────────────────────────────────────────────
         display_message = message
         media_base64 = None
 
-        # Extrai caption limpo de imagens (remove prefixo "[Imagem]: " do parse_webhook)
-        # Se imagem sem legenda, usa texto descritivo para não passar string vazia ao AI
         if media_type == "image":
             if ": " in message:
                 display_message = message.split(": ", 1)[1]
@@ -195,7 +229,6 @@ class QualifierAgent:
         elif media_type == "audio" and not media_base64:
             display_message = "[Áudio recebido - não foi possível processar]"
 
-        # ── Follow-up automático ao retomar ─────────────────────────────────
         if customer.lead_status == "qualificando" and customer.total_messages and customer.total_messages > 3:
             if customer.summary and "Nota " in (customer.summary or ""):
                 follow_up_system = build_qualifier_prompt(owner=owner, customer=customer.model_dump(), history_summary=customer.summary or "", knowledge_context=knowledge_context)
@@ -214,19 +247,16 @@ class QualifierAgent:
                 await self.memory.save_turn(phone, owner_id, "assistant", follow_up)
                 return
 
-        # ── Captura de nome (apenas quando bot perguntou e texto parece nome real) ─
         if not customer.name:
             detected_name = await self.memory.detect_and_save_name(phone, owner_id, display_message, history=history)
             if detected_name:
                 customer = await self.memory.get_or_create_customer(phone, owner_id)
 
-        # ── Detecção de canal de origem ──────────────────────────────────────
         if not customer.channel and (customer.total_messages or 0) == 0:
             channel = _detect_channel(display_message)
             if channel:
                 await self.memory.set_channel(phone, owner_id, channel)
 
-        # ── Detecção de aniversário ─────────────────────────────────────────
         if not customer.birthday:
             from app.agents.attendant import _detect_birthday
             detected_bday = _detect_birthday(display_message)
@@ -266,7 +296,7 @@ class QualifierAgent:
                     f"{urgency_icon} *SOS — Atenção necessária!*\n\n"
                     f"👤 *{name}* | Score: *{new_score}*\n"
                     f"📱 wa.me/{re.sub(r'[^0-9]', '', phone)}\n"
-                    f"🎭 Sentimento: *{sentiment}*\n"
+                    f"🎤 Sentimento: *{sentiment}*\n"
                     f"📌 Motivo: {human_reason}\n\n"
                 )
                 if customer.summary:
@@ -293,11 +323,30 @@ class QualifierAgent:
                 "Exemplo: 'Entendi perfeitamente. Deixa eu verificar isso com mais cuidado pra te dar a melhor resposta. Já te retorno!'"
             )
 
+        # ── Busca web em tempo real: @handles, URLs ────────────────────────────────
+        web_context = ""
+        _needs_search, _search_query = _detect_web_search_need(display_message)
+        if _needs_search and _search_query:
+            logger.info("[Qualifier] Busca web: '%s'", _search_query[:60])
+            web_context = await _fetch_web_context(_search_query)
+            if web_context:
+                logger.info("[Qualifier] Contexto web obtido (%d chars)", len(web_context))
+            else:
+                logger.info("[Qualifier] Busca web sem resultados para '%s'", _search_query[:60])
+
+        web_block = (
+            "\n\n━━ CONTEXTO WEB (AGORA) ━━\n"
+            "Busquei na internet agora sobre o que o cliente mencionou:\n"
+            f"{web_context}\n"
+            "Use essas informações para responder com inteligência e especificidade. "
+            "Se não tiver detalhes suficientes, seja honesto mas útil — nunca fique em silêncio."
+        ) if web_context else ""
+
         system_prompt = build_qualifier_prompt(
             owner=owner, customer=customer.model_dump(),
             history_summary=customer.summary or "",
             knowledge_context=knowledge_context,
-        ) + sos_instruction
+        ) + sos_instruction + web_block
 
         if media_type == "image" and media_base64:
             user_msg_for_image = display_message or "O que você acha disso?"
@@ -313,7 +362,6 @@ class QualifierAgent:
                 system_prompt=system_prompt, history=history,
                 user_message=display_message, use_gemini=is_simple)
 
-        # Guard: AI retornou None/vazio (erro na API) — envia fallback natural ao lead
         if not response:
             logger.warning(f"[Qualifier] Resposta vazia do AI para {phone} | media={media_type} — enviando fallback")
             fallback = "Hmm, tive um problema aqui. Pode repetir o que você disse?"
