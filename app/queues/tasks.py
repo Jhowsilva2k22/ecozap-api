@@ -282,6 +282,7 @@ def follow_up_active(self, phone: str, owner_id: str):
     try:
         from app.services.contact import ContactService
         from app.services.whatsapp import WhatsAppService
+        from app.database import get_db
 
         contact_svc = ContactService()
         wa_svc = WhatsAppService()
@@ -291,10 +292,15 @@ def follow_up_active(self, phone: str, owner_id: str):
             logger.info(f"[Follow-up Active] Nenhum contato ativo hoje para {owner_id}")
             return
 
+        # Busca evolution_instance do owner para envio correto (multi-tenant)
+        db = get_db()
+        owner_resp = db.table("owners").select("evolution_instance").eq("id", owner_id).single().execute()
+        evolution_instance = (owner_resp.data or {}).get("evolution_instance", "")
+
         for contact in active_contacts:
             try:
                 msg = f"Olá {contact.first_name or contact.name}! Tudo bem? Tem algo que eu possa ajudar? 😊"
-                run_async(wa_svc.send_message(phone, contact.phone, msg))
+                run_async(wa_svc.send_message(contact.phone, msg, instance=evolution_instance))
                 logger.info(f"[Follow-up Active] Enviado para {contact.phone}")
             except Exception as e:
                 logger.error(f"[Follow-up Active] Erro ao enviar para {contact.phone}: {e}")
@@ -321,7 +327,8 @@ def follow_up_cold_leads(self):
         progress = get_progress("follow_up_cold_leads")
         processed_owners = set(progress.get("done", [])) if progress else set()
 
-        owners_resp = db.table("owners").select("id, phone").execute()
+        # Inclui evolution_instance para envio multi-tenant correto
+        owners_resp = db.table("owners").select("id, phone, evolution_instance").execute()
         owners = owners_resp.data or []
 
         if not owners:
@@ -335,8 +342,11 @@ def follow_up_cold_leads(self):
             if owner_id in processed_owners:
                 continue
 
-            phone = owner.get("phone", "")
-            if not phone:
+            evolution_instance = owner.get("evolution_instance", "")
+            if not evolution_instance:
+                logger.warning(f"[Follow-up Cold] Owner {owner_id} sem evolution_instance — pulando")
+                processed_owners.add(owner_id)
+                save_progress("follow_up_cold_leads", {"done": list(processed_owners)})
                 continue
 
             try:
@@ -360,7 +370,7 @@ def follow_up_cold_leads(self):
                     try:
                         name = lead.get("first_name") or lead.get("name") or "você"
                         msg = f"Oi {name}! Faz um tempo que não conversamos. Posso te ajudar com algo? 😊"
-                        run_async(wa_svc.send_message(phone, lead["phone"], msg))
+                        run_async(wa_svc.send_message(lead["phone"], msg, instance=evolution_instance))
                     except Exception as e:
                         logger.error(f"[Follow-up Cold] Erro ao enviar para {lead.get('phone')}: {e}")
 
@@ -392,7 +402,8 @@ def nurture_customers(self):
         progress = get_progress("nurture_customers")
         processed_owners = set(progress.get("done", [])) if progress else set()
 
-        owners_resp = db.table("owners").select("id, phone").execute()
+        # Inclui evolution_instance para envio multi-tenant correto
+        owners_resp = db.table("owners").select("id, phone, evolution_instance").execute()
         owners = owners_resp.data or []
 
         if not owners:
@@ -404,8 +415,11 @@ def nurture_customers(self):
             if owner_id in processed_owners:
                 continue
 
-            phone = owner.get("phone", "")
-            if not phone:
+            evolution_instance = owner.get("evolution_instance", "")
+            if not evolution_instance:
+                logger.warning(f"[Nurture] Owner {owner_id} sem evolution_instance — pulando")
+                processed_owners.add(owner_id)
+                save_progress("nurture_customers", {"done": list(processed_owners)})
                 continue
 
             try:
@@ -427,7 +441,7 @@ def nurture_customers(self):
                     try:
                         name = customer.get("first_name") or customer.get("name") or "você"
                         msg = f"Olá {name}! Obrigado por ser cliente! Quer conhecer nossas novidades? ✨"
-                        run_async(wa_svc.send_message(phone, customer["phone"], msg))
+                        run_async(wa_svc.send_message(customer["phone"], msg, instance=evolution_instance))
                     except Exception as e:
                         logger.error(f"[Nurture] Erro ao enviar para {customer.get('phone')}: {e}")
 
