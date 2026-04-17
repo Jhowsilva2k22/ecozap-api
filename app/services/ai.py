@@ -20,7 +20,7 @@ class AIService:
             self.gemini = genai.GenerativeModel(GEMINI_FLASH)
         else:
             self.gemini = None
-        # OpenAI para Whisper
+        # OpenAI para Whisper + GPT-4o Vision
         if settings.openai_api_key:
             from openai import OpenAI
             self.openai = OpenAI(api_key=settings.openai_api_key)
@@ -85,7 +85,6 @@ Responda APENAS o JSON."""
         try:
             response = self.claude.messages.create(model=CLAUDE_HAIKU, max_tokens=200, messages=[{"role": "user", "content": prompt}])
             raw = response.content[0].text.strip()
-            # Remove ```json wrapper se existir
             if raw.startswith("```"):
                 raw = raw.split("```")[1].replace("json", "").strip()
             result = json.loads(raw)
@@ -95,7 +94,7 @@ Responda APENAS o JSON."""
             logger.error(f"[Classify] ERRO ao classificar '{message[:40]}': {e}")
             return {"intent": "outros", "lead_score_delta": 0, "is_simple": False, "urgency": "media", "sentiment": "neutro"}
 
-    # ── HELPERS DE MÍDIA ──────────────────────────────────────────────────────
+    # ── HELPERS DE MÍDIA ──────────────────────────────────────────────────────────
 
     def _parse_base64(self, b64: str) -> tuple:
         """Remove prefixo data URL se existir. Retorna (base64_limpo, mime_type)."""
@@ -110,19 +109,30 @@ Responda APENAS o JSON."""
         return [{"role": m["role"], "content": m["content"]} for m in history]
 
     async def respond_with_image(self, system_prompt: str, history: list, user_message: str, image_base64: str) -> str:
-        """Analisa imagem — GPT-4o Vision (OpenAI) com fallback Claude Sonnet."""
+        """
+        Analisa imagem — GPT-4o Vision (OpenAI) com fallback Claude Sonnet.
+
+        IMPORTANTE: não pede análise de rostos/pessoas — causa recusa dos modelos.
+        Foca em: contexto, textos visíveis, produtos, screenshots, cenário.
+        Para selfies: reage de forma amigável sem tentar identificar.
+        """
         data, mime = self._parse_base64(image_base64)
         mime = mime or "image/jpeg"
+
+        # Caption: usa o que o lead mandou ou instruição genérica sem análise de face
         if user_message and not user_message.startswith("[Imagem"):
             caption_text = user_message
         else:
             caption_text = (
-                "Analise esta imagem com TODOS os detalhes: textos visíveis, títulos, "
-                "cores, objetos, marcas, números, rostos, cenário. "
-                "Depois responda de forma natural conforme seu papel de atendente."
+                "Olhe esta imagem e responda como atendente de forma natural. "
+                "Se tiver textos, produtos, screenshots, documentos ou informações visíveis: "
+                "mencione o que for relevante para ajudar. "
+                "Se for uma foto pessoal ou selfie: reaja de forma amigável e pergunte como pode ajudar. "
+                "NÃO tente identificar, nomear ou descrever características físicas de pessoas. "
+                "Foque no contexto e em como o atendente pode ajudar."
             )
 
-        # ── GPT-4o Vision ─────────────────────────────────────────────────────
+        # ── GPT-4o Vision ──────────────────────────────────────────────────
         if self.openai:
             try:
                 messages = [{"role": "system", "content": system_prompt}]
@@ -134,7 +144,9 @@ Responda APENAS o JSON."""
                 resp = self.openai.chat.completions.create(
                     model="gpt-4o", messages=messages, max_tokens=MAX_RESPONSE_TOKENS
                 )
-                return resp.choices[0].message.content.strip()
+                result = resp.choices[0].message.content.strip()
+                logger.info(f"[GPT-4o Vision] resposta OK: {result[:60]}")
+                return result
             except Exception as e:
                 logger.error(f"[GPT-4o Vision] erro: {e} — usando Claude como fallback")
 
@@ -148,17 +160,19 @@ Responda APENAS o JSON."""
                 model=CLAUDE_SONNET, max_tokens=MAX_RESPONSE_TOKENS,
                 system=system_prompt, messages=msgs
             )
-            return response.content[0].text.strip()
+            result = response.content[0].text.strip()
+            logger.info(f"[Claude Vision] resposta OK: {result[:60]}")
+            return result
         except Exception as e:
             logger.error(f"[Claude Vision] erro: {e}")
-            return "Recebi sua imagem! Pode me descrever o que você precisa sobre ela?"
+            return ""
 
     async def respond_with_pdf(self, system_prompt: str, history: list, user_message: str, pdf_base64: str) -> str:
         """Lê PDF — GPT-4o (extrai texto) com fallback Claude nativo."""
         data, _ = self._parse_base64(pdf_base64)
         doc_question = user_message if user_message and not user_message.startswith("[PDF") and not user_message.startswith("[Documento") else "Resuma o conteúdo deste documento de forma útil."
 
-        # ── GPT-4o + extração de texto ─────────────────────────────────────────
+        # ── GPT-4o + extração de texto ────────────────────────────────────────────
         if self.openai:
             try:
                 import pypdf
@@ -176,7 +190,7 @@ Responda APENAS o JSON."""
             except Exception as e:
                 logger.error(f"[GPT-4o PDF] erro: {e} — usando Claude como fallback")
 
-        # ── Claude Sonnet fallback (suporte nativo a PDF) ─────────────────────
+        # ── Claude Sonnet fallback (suporte nativo a PDF) ────────────────────
         try:
             msgs = history + [{"role": "user", "content": [
                 {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}},
@@ -196,7 +210,7 @@ Responda APENAS o JSON."""
         data, mime = self._parse_base64(audio_base64)
         audio_bytes = b64lib.b64decode(data)
 
-        # ── Whisper (OpenAI) — prioridade ─────────────────────────────────────
+        # ── Whisper (OpenAI) — prioridade ────────────────────────────────────────
         if self.openai:
             try:
                 audio_file = io.BytesIO(audio_bytes)
@@ -231,7 +245,7 @@ Responda APENAS o JSON."""
 
         return ""
 
-    # ── FIM HELPERS DE MÍDIA ──────────────────────────────────────────────────
+    # ── FIM HELPERS DE MÍDIA ───────────────────────────────────────────────────
 
     async def compress_conversation(self, messages: list) -> str:
         text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
