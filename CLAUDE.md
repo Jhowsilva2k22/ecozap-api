@@ -1,6 +1,6 @@
 # EcoZap — Contexto para Claude Code
 > Lido automaticamente pelo terminal Claude Code ao entrar nesta pasta.
-> Atualizado a cada sprint. Última atualização: 2026-04-16 | Commit: `e964dca`
+> Atualizado a cada sprint. Última atualização: 2026-04-16 | Commit: `77ff306`
 
 ---
 
@@ -16,7 +16,7 @@ retém clientes, aprende todo dia e se auto-corrige quando algo dá errado.
 
 ---
 
-## ESTADO ATUAL — Sprint 3 em andamento ✅
+## ESTADO ATUAL — Sprint 4: Painel Web entregue ✅
 
 ### O que está funcionando em produção
 - Sentinel → Doctor → Surgeon (pipeline de auto-correção a cada 5 min via Celery)
