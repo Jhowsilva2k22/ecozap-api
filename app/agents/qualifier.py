@@ -10,32 +10,14 @@ HANDOFF_SCORE = 70
 
 # Palavras-chave para detectar canal de origem na primeira mensagem
 _CHANNEL_KEYWORDS = {
-    "reels": "reels",
-    "reel": "reels",
-    "stories": "stories",
-    "story": "stories",
-    "anuncio": "anuncio",
-    "anúncio": "anuncio",
-    "ads": "anuncio",
-    "trafego": "anuncio",
-    "tráfego": "anuncio",
-    "youtube": "youtube",
-    "yt": "youtube",
-    "video": "video",
-    "vídeo": "video",
-    "post": "post",
-    "feed": "feed",
-    "direct": "direct",
-    "dm": "direct",
-    "indicação": "indicacao",
-    "indicacao": "indicacao",
-    "indicou": "indicacao",
-    "me indicaram": "indicacao",
-    "amigo": "indicacao",
-    "google": "google",
-    "pesquisa": "google",
-    "site": "site",
-    "utm": "campanha",
+    "reels": "reels", "reel": "reels", "stories": "stories", "story": "stories",
+    "anuncio": "anuncio", "anúncio": "anuncio", "ads": "anuncio",
+    "trafego": "anuncio", "tráfego": "anuncio", "youtube": "youtube",
+    "yt": "youtube", "video": "video", "vídeo": "video", "post": "post",
+    "feed": "feed", "direct": "direct", "dm": "direct",
+    "indicação": "indicacao", "indicacao": "indicacao", "indicou": "indicacao",
+    "me indicaram": "indicacao", "amigo": "indicacao", "google": "google",
+    "pesquisa": "google", "site": "site", "utm": "campanha",
 }
 
 def _detect_channel(message: str) -> str:
@@ -67,7 +49,6 @@ def build_qualifier_prompt(owner: dict, customer: dict, history_summary: str, kn
     display_name = customer_name or "o lead"
     name_usage = f"\nUSO DO NOME: O nome do lead é {customer_name}. Use o nome dele de forma natural nas respostas — não em toda mensagem, mas quando fizer sentido humanizar." if customer_name else ""
 
-    # Temperatura do lead para guiar abordagem
     if customer_score >= 70:
         temperatura = "🔥 QUENTE — está próximo de decidir. Reduza fricção, não desperdice com perguntas desnecessárias."
     elif customer_score >= 40:
@@ -153,6 +134,9 @@ class QualifierAgent:
         if not owner:
             return
 
+        # ── Instância Evolution correta para este owner (multi-tenant) ──────
+        evolution_instance = owner.get("evolution_instance") or ""
+
         # Canal do lead (whatsapp ou instagram)
         ch = customer.channel or "whatsapp"
 
@@ -160,11 +144,10 @@ class QualifierAgent:
         is_first_contact = (customer.total_messages or 0) == 0
         welcome_msg = (owner.get("welcome_message") or "")
         if is_first_contact and welcome_msg:
-            # Substitui variáveis dinâmicas
             final_welcome = welcome_msg.replace("{nome}", customer.name or "")
             final_welcome = final_welcome.replace("{negocio}", owner.get("business_name", ""))
-            await sender.send_typing(phone, channel=ch, duration=len(final_welcome) * 40)
-            await sender.send_message(phone, final_welcome, channel=ch)
+            await sender.send_typing(phone, channel=ch, duration=len(final_welcome) * 40, instance=evolution_instance)
+            await sender.send_message(phone, final_welcome, channel=ch, instance=evolution_instance)
             await self.memory.save_turn(phone, owner_id, "assistant", final_welcome)
 
         history = await self.memory.get_conversation_history(phone, owner_id)
@@ -176,14 +159,14 @@ class QualifierAgent:
             kb = KnowledgeBank()
             knowledge_context = kb.get_context_for_prompt(owner_id, query=message, limit=6)
         except Exception as _ke:
-            pass  # não quebra se KB não estiver disponível
+            pass
 
-        # ── Processa mídia (mantém fluxo de texto intacto) ──────────────────
+        # ── Processa mídia ──────────────────────────────────────────────────
         display_message = message
         media_base64 = None
 
         if media_type in ("image", "audio", "document") and message_id:
-            media_base64 = await sender.download_media(message_id, phone=phone, channel=ch)
+            media_base64 = await sender.download_media(message_id, phone=phone, channel=ch, instance=evolution_instance)
             if not media_base64:
                 logger.warning(f"[Qualifier] falha ao baixar mídia tipo={media_type} id={message_id}")
 
@@ -195,11 +178,9 @@ class QualifierAgent:
             media_type = "text"
         elif media_type == "audio" and not media_base64:
             display_message = "[Áudio recebido - não foi possível processar]"
-        # ────────────────────────────────────────────────────────────────────
 
-        # ── Follow-up automático ao retomar (dia seguinte após handoff humano) ─
+        # ── Follow-up automático ao retomar ─────────────────────────────────
         if customer.lead_status == "qualificando" and customer.total_messages and customer.total_messages > 3:
-            # Verifica se havia estado em atendimento humano antes (summary contém nota de handoff)
             if customer.summary and "Nota " in (customer.summary or ""):
                 follow_up_system = build_qualifier_prompt(owner=owner, customer=customer.model_dump(), history_summary=customer.summary or "", knowledge_context=knowledge_context)
                 follow_up_instruction = (
@@ -209,23 +190,21 @@ class QualifierAgent:
                     "Seja genuíno e humano."
                 )
                 follow_up = await self.ai.respond(
-                    system_prompt=follow_up_system,
-                    history=[],
-                    user_message=follow_up_instruction,
-                    use_gemini=False
+                    system_prompt=follow_up_system, history=[],
+                    user_message=follow_up_instruction, use_gemini=False
                 )
-                await sender.send_typing(phone, channel=ch, duration=len(follow_up) * 40)
-                await sender.send_message(phone, follow_up, channel=ch)
+                await sender.send_typing(phone, channel=ch, duration=len(follow_up) * 40, instance=evolution_instance)
+                await sender.send_message(phone, follow_up, channel=ch, instance=evolution_instance)
                 await self.memory.save_turn(phone, owner_id, "assistant", follow_up)
                 return
 
-        # ── Captura de nome (primeira mensagem curta sem nome salvo) ─────────
+        # ── Captura de nome ──────────────────────────────────────────────────
         if not customer.name:
             detected_name = await self.memory.detect_and_save_name(phone, owner_id, display_message)
             if detected_name:
                 customer = await self.memory.get_or_create_customer(phone, owner_id)
 
-        # ── Detecção de canal de origem (primeira mensagem) ──────────────────
+        # ── Detecção de canal de origem ──────────────────────────────────────
         if not customer.channel and (customer.total_messages or 0) == 0:
             channel = _detect_channel(display_message)
             if channel:
@@ -245,18 +224,15 @@ class QualifierAgent:
         is_simple = classification.get("is_simple", False)
         new_score = min(100, max(0, (customer.lead_score or 0) + score_delta))
 
-        # ── Progressão automática de status ─────────────────────────────
         from app.agents.attendant import _auto_status
         new_status = _auto_status(customer.lead_status, new_score)
 
-        # ── Detecção automática de venda confirmada ─────────────────────
         if intent == "compra_confirmada" and new_status != "cliente":
             new_status = "cliente"
             new_score = 100
             await self._notify_sale(phone, owner, customer)
             logger.info(f"[Qualifier] VENDA DETECTADA! {phone} virou cliente automaticamente")
 
-        # ── SOS: Escalonamento inteligente ──────────────────────────────
         needs_human = classification.get("needs_human", False)
         human_reason = classification.get("human_reason", "")
         sos_sent = False
@@ -280,8 +256,8 @@ class QualifierAgent:
                 if customer.summary:
                     sos_alert += f"📝 Contexto: {customer.summary[:200]}\n\n"
                 sos_alert += "👉 Copie a próxima mensagem e envie pra assumir:"
-                await self.whatsapp.send_message(notify_phone, sos_alert)
-                await self.whatsapp.send_message(notify_phone, f"/assumir {phone}")
+                await self.whatsapp.send_message(notify_phone, sos_alert, instance=evolution_instance)
+                await self.whatsapp.send_message(notify_phone, f"/assumir {phone}", instance=evolution_instance)
                 sos_sent = True
                 logger.info(f"[SOS] Alerta enviado para dono! {phone} | motivo: {human_reason}")
 
@@ -290,7 +266,6 @@ class QualifierAgent:
             await self._trigger_handoff(phone, owner, customer, display_message)
         await self.memory.save_turn(phone, owner_id, "user", display_message)
 
-        # Se SOS acionado, injeta instrução de contenção
         sos_instruction = ""
         if sos_sent:
             sos_instruction = (
@@ -323,7 +298,6 @@ class QualifierAgent:
 
         await self.memory.save_turn(phone, owner_id, "assistant", response)
         sentiment = classification.get("sentiment", "neutro")
-        # Atualiza histórico de sentimento (últimos 10)
         sent_history = list(customer.sentiment_history or [])[-9:]
         sent_history.append(sentiment)
         await self.memory.update_customer(phone, owner_id, {
@@ -331,15 +305,15 @@ class QualifierAgent:
             "last_intent": intent, "total_messages": (customer.total_messages or 0) + 1,
             "last_sentiment": sentiment, "sentiment_history": sent_history
         })
-        await sender.send_typing(phone, channel=ch, duration=len(response) * 40)
-        await sender.send_message(phone, response, channel=ch)
-        logger.info(f"[Qualifier] {phone} | intent={intent} | score={new_score} | media={media_type} | ch={ch}")
+        await sender.send_typing(phone, channel=ch, duration=len(response) * 40, instance=evolution_instance)
+        await sender.send_message(phone, response, channel=ch, instance=evolution_instance)
+        logger.info(f"[Qualifier] {phone} | intent={intent} | score={new_score} | media={media_type} | ch={ch} | inst={evolution_instance}")
 
     async def _trigger_handoff(self, phone: str, owner: dict, customer, message: str):
         notify_phone = owner.get("notify_phone")
         if not notify_phone:
             return
-
+        evolution_instance = owner.get("evolution_instance") or ""
         clean_phone = re.sub(r'\D', '', phone)
         wa_link = f"wa.me/{clean_phone}"
         name = customer.name or "Sem nome"
@@ -359,15 +333,15 @@ class QualifierAgent:
             f"💬 *Última mensagem:*\n_{message}_\n\n"
             f"👉 Copie a próxima mensagem e envie pra assumir:"
         )
-        await self.whatsapp.send_message(notify_phone, alert)
-        await self.whatsapp.send_message(notify_phone, f"/assumir {phone}")
+        await self.whatsapp.send_message(notify_phone, alert, instance=evolution_instance)
+        await self.whatsapp.send_message(notify_phone, f"/assumir {phone}", instance=evolution_instance)
 
     async def _notify_sale(self, phone: str, owner: dict, customer):
         """Notifica o dono quando uma venda é detectada automaticamente."""
         notify_phone = owner.get("notify_phone")
         if not notify_phone:
             return
-
+        evolution_instance = owner.get("evolution_instance") or ""
         clean_phone = re.sub(r'\D', '', phone)
         wa_link = f"wa.me/{clean_phone}"
         name = customer.name or "Sem nome"
@@ -383,4 +357,4 @@ class QualifierAgent:
             f"Status atualizado automaticamente pra *cliente*.\n"
             f"O agente agora cuida do pós-venda e relacionamento."
         )
-        await self.whatsapp.send_message(notify_phone, alert)
+        await self.whatsapp.send_message(notify_phone, alert, instance=evolution_instance)
