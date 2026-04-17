@@ -45,9 +45,9 @@ def build_qualifier_prompt(owner: dict, customer: dict, history_summary: str, kn
     total_msgs = customer.get("total_messages", 0)
     name_instruction = ""
     if not customer_name and total_msgs <= 2:
-        name_instruction = "\nNOME: Ainda não sei o nome. Pergunte de forma natural e casual numa das primeiras trocas (apenas UMA vez)."
+        name_instruction = "\nNOME: Ainda não sei o nome. Descubra durante a conversa de forma natural — quando houver abertura, pergunte como a pessoa prefere ser chamada (ex: 'como posso te chamar?'). Faça apenas UMA vez. NUNCA comente nem reaja ao nome recebido — use-o direto, como alguém que já conhece."
     display_name = customer_name or "o lead"
-    name_usage = f"\nUSO DO NOME: O nome do lead é {customer_name}. Use o nome dele de forma natural nas respostas — não em toda mensagem, mas quando fizer sentido humanizar." if customer_name else ""
+    name_usage = f"\nUSO DO NOME: O nome do lead é {customer_name}. Use de forma completamente natural — não em toda mensagem, não como abertura forçada. NUNCA comente, elogie, questione ou reaja ao nome, seja ele qual for. Use-o como qualquer pessoa usaria o nome de um amigo numa conversa." if customer_name else ""
 
     if customer_score >= 70:
         temperatura = "🔥 QUENTE — está próximo de decidir. Reduza fricção, não desperdice com perguntas desnecessárias."
@@ -169,6 +169,13 @@ class QualifierAgent:
         display_message = message
         media_base64 = None
 
+        # Extrai caption limpo de imagens (remove prefixo "[Imagem]: " do parse_webhook)
+        if media_type == "image":
+            if ": " in message:
+                display_message = message.split(": ", 1)[1]
+            elif message.startswith("[Imagem"):
+                display_message = ""
+
         if media_type in ("image", "audio", "document") and message_id:
             media_base64 = await sender.download_media(message_id, phone=phone, channel=ch, instance=evolution_instance)
             if not media_base64:
@@ -202,9 +209,9 @@ class QualifierAgent:
                 await self.memory.save_turn(phone, owner_id, "assistant", follow_up)
                 return
 
-        # ── Captura de nome ──────────────────────────────────────────────────
+        # ── Captura de nome (apenas quando bot perguntou e texto parece nome real) ─
         if not customer.name:
-            detected_name = await self.memory.detect_and_save_name(phone, owner_id, display_message)
+            detected_name = await self.memory.detect_and_save_name(phone, owner_id, display_message, history=history)
             if detected_name:
                 customer = await self.memory.get_or_create_customer(phone, owner_id)
 
@@ -288,9 +295,10 @@ class QualifierAgent:
         ) + sos_instruction
 
         if media_type == "image" and media_base64:
+            user_msg_for_image = display_message or "O que você acha disso?"
             response = await self.ai.respond_with_image(
                 system_prompt=system_prompt, history=history,
-                user_message=message, image_base64=media_base64)
+                user_message=user_msg_for_image, image_base64=media_base64)
         elif media_type == "document" and media_base64:
             response = await self.ai.respond_with_pdf(
                 system_prompt=system_prompt, history=history,
@@ -299,6 +307,11 @@ class QualifierAgent:
             response = await self.ai.respond(
                 system_prompt=system_prompt, history=history,
                 user_message=display_message, use_gemini=is_simple)
+
+        # Guard: AI pode retornar None/vazio em casos de erro — evita crash em len(response)
+        if not response:
+            logger.warning(f"[Qualifier] Resposta vazia do AI para {phone} | media={media_type}")
+            return
 
         await self.memory.save_turn(phone, owner_id, "assistant", response)
         sentiment = classification.get("sentiment", "neutro")
