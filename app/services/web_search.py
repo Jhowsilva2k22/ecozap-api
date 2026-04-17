@@ -5,14 +5,17 @@ Busca notícias e tendências via Brave Search API, resume com Claude Haiku
 e salva no KnowledgeBank do tenant como aprendizados diários.
 
 Fluxo:
-  1. Recebe lista de tópicos (ou usa DEFAULT_TOPICS)
-  2. Busca cada tópico na Brave Search (últimos 7 dias, pt-BR)
+  1. Recebe role (ou usa DEFAULT_TOPICS)
+  2. Busca tópicos específicos do role na Brave Search (últimos 7 dias, pt-BR)
   3. Resume top resultados com Claude Haiku (barato e rápido)
   4. Upsert no knowledge_items: ATUALIZA se tópico já existe, CRIA se novo
      → Nunca acumula entradas obsoletas sobre o mesmo tema
 
+Roles disponíveis: qualifier, attendant, sdr, closer, consultant, trainer, ops
+
 Requisito: BRAVE_API_KEY no Railway env
   → https://api.search.brave.com (plano Free: 2.000 buscas/mês)
+  → Com 7 roles × 2-3 tópicos ≈ 17 calls/tenant/dia — seguro até ~3 tenants
 """
 
 import logging
@@ -27,10 +30,67 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # ---------------------------------------------------------------------------
-# Tópicos padrão — genéricos, aplicáveis a qualquer negócio no WhatsApp
+# Tópicos por role — cada agente é maestro na sua especialidade
 # ---------------------------------------------------------------------------
+TOPICS_BY_ROLE: dict[str, list[str]] = {
+    # Qualificador: primeiro contato, rapport, triagem
+    "qualifier": [
+        "técnicas qualificação leads WhatsApp abordagem inicial conversão",
+        "perguntas qualificação lead comercial WhatsApp pequenas empresas",
+        "rapport inicial clientes WhatsApp como criar conexão interesse",
+    ],
+    # Atendente: suporte, dúvidas, experiência pós-venda
+    "attendant": [
+        "atendimento ao cliente WhatsApp respostas rápidas humanização",
+        "experiência cliente automação WhatsApp sem parecer robô",
+        "gestão reclamações WhatsApp clientes insatisfeitos como lidar",
+    ],
+    # SDR: prospecção fria, cadência, BANT
+    "sdr": [
+        "prospecção ativa WhatsApp mensagem fria abordagem SDR",
+        "cadência follow-up leads WhatsApp sequência mensagens",
+        "qualificação BANT leads frios WhatsApp pequenas empresas",
+    ],
+    # Closer: fechamento, objeções, urgência
+    "closer": [
+        "técnicas fechamento vendas WhatsApp objeções contorno",
+        "urgência escassez gatilhos persuasão WhatsApp conversão",
+        "scripts fechamento vendas WhatsApp objeção de preço",
+    ],
+    # Consultor: retenção, onboarding, upsell
+    "consultant": [
+        "retenção clientes pós-venda WhatsApp sucesso do cliente",
+        "upsell cross-sell clientes existentes WhatsApp estratégias",
+        "onboarding clientes novos WhatsApp reduzir churn",
+    ],
+    # Trainer: gestão de conhecimento, treinamento, documentação
+    "trainer": [
+        "gestão conhecimento equipes vendas treinamento contínuo",
+        "documentação processos comerciais pequenas empresas como fazer",
+        "treinamento IA agentes automação WhatsApp melhores práticas",
+    ],
+    # Ops (Sentinel, Doctor, Surgeon, Guardian): infra, APIs, deploy
+    "ops": [
+        "Evolution API WhatsApp Business instabilidades erros 2026",
+        "Railway deploy containers Python uptime monitoramento produção",
+        "Celery Redis workers falhas troubleshooting alta disponibilidade",
+    ],
+}
+
+# Label legível para marcação no conteúdo salvo no KB
+ROLE_LABELS: dict[str, str] = {
+    "qualifier": "Qualificação",
+    "attendant": "Atendimento",
+    "sdr": "SDR",
+    "closer": "Closer",
+    "consultant": "Consultoria",
+    "trainer": "Treinamento",
+    "ops": "Ops/Infra",
+}
+
+# Fallback genérico — retrocompatibilidade com chamadas sem role
 DEFAULT_TOPICS = [
-    "tendências vendas WhatsApp Business 2025 Brasil",
+    "tendências vendas WhatsApp Business 2026 Brasil",
     "estratégias atendimento ao cliente automatizado IA",
     "marketing digital pequenas empresas brasileiras",
     "copywriting persuasivo WhatsApp conversão vendas",
@@ -100,9 +160,10 @@ class WebSearchService:
 
     # ──────────────────────── sumarização ────────────────────────
 
-    def _summarize(self, topic: str, results: list[dict]) -> Optional[str]:
+    def _summarize(self, topic: str, results: list[dict], role: Optional[str] = None) -> Optional[str]:
         """
         Usa Claude Haiku para sintetizar os resultados em insights práticos.
+        O prompt é ajustado conforme o role para extrair insights relevantes à função.
         Retorna None se não houver conteúdo ou se Claude falhar.
         """
         snippets = "\n".join(
@@ -114,16 +175,30 @@ class WebSearchService:
         if not snippets:
             return None
 
+        # Contexto do role para o prompt de sumarização
+        role_contexts = {
+            "qualifier": "um agente de qualificação de leads no WhatsApp, que precisa identificar oportunidades e criar conexão rápida",
+            "attendant": "um agente de atendimento ao cliente no WhatsApp, que resolve dúvidas e mantém a satisfação",
+            "sdr": "um SDR (Sales Development Rep) que prospecta e aquece leads frios no WhatsApp",
+            "closer": "um closer de vendas que fecha negócios e contorna objeções no WhatsApp",
+            "consultant": "um consultor de sucesso do cliente que retém e faz upsell no WhatsApp",
+            "trainer": "um agente de treinamento que documenta processos e capacita equipes de vendas",
+            "ops": "um engenheiro de operações que monitora infra, APIs e deploys em produção",
+        }
+
+        role_ctx = role_contexts.get(role or "", "um agente de vendas e atendimento via WhatsApp")
+
         prompt = (
-            f"Você é um analista de negócios brasileiro. Analise os resultados de busca abaixo "
-            f"sobre o tema: '{topic}'.\n\n"
-            f"Extraia 2-3 insights práticos e aplicáveis para pequenas empresas que vendem via WhatsApp.\n\n"
+            f"Você é {role_ctx}.\n\n"
+            f"Analise os resultados de busca abaixo sobre: '{topic}'.\n\n"
+            f"Extraia 2-3 insights práticos e aplicáveis ESPECIFICAMENTE para a sua função.\n\n"
             f"Resultados:\n{snippets}\n\n"
             f"Regras:\n"
             f"- Escreva em português direto, sem enrolação\n"
             f"- Máximo 3 bullets curtos (1-2 linhas cada)\n"
-            f"- Só insights que um vendedor pode usar hoje\n"
-            f"- Nada genérico, nada óbvio"
+            f"- Só insights que você pode usar hoje na sua função\n"
+            f"- Nada genérico, nada óbvio\n"
+            f"- Foque no que é relevante para: {role_ctx}"
         )
 
         try:
@@ -145,24 +220,51 @@ class WebSearchService:
         self,
         owner_id: str,
         topics: Optional[list[str]] = None,
+        role: Optional[str] = None,
     ) -> int:
         """
         Executa o ciclo completo: busca → resume → upsert no KnowledgeBank.
 
+        Prioridade de tópicos:
+          1. topics= explícito (override manual)
+          2. role= (usa TOPICS_BY_ROLE[role]) → agente maestro da sua função
+          3. DEFAULT_TOPICS (fallback genérico)
+
+        O conteúdo salvo é marcado com o role:
+          [SDR: prospecção ativa WhatsApp...]  → identificável no KB
+          [Closer: técnicas fechamento...]
+
+        O source inclui o role:
+          'web_search:closer | https://...'
+        → o upsert nunca confunde tópicos de roles diferentes.
+
         Usa upsert_topic_item() em vez de add_item():
-        - Se o tópico já existir no banco → ATUALIZA conteúdo e data
+        - Se o tópico já existir → ATUALIZA conteúdo e data
         - Se não existir → CRIA nova entrada
-        Isso mantém o banco sempre com exatamente 1 entrada por tópico,
-        sempre com a versão mais recente — sem acúmulo infinito.
+        Mantém o banco sempre com exatamente 1 entrada por tópico por role.
 
         Retorna o número de tópicos salvos/atualizados.
         """
         kb = KnowledgeBank()
-        topics_to_search = topics or DEFAULT_TOPICS
+
+        # Resolve tópicos
+        if topics:
+            topics_to_search = topics
+        elif role and role in TOPICS_BY_ROLE:
+            topics_to_search = TOPICS_BY_ROLE[role]
+        else:
+            topics_to_search = DEFAULT_TOPICS
+
+        # Label do role para marcação no conteúdo
+        role_label = ROLE_LABELS.get(role or "", "Tendência")
+        # Prefixo de source com role para evitar colisão no upsert
+        source_prefix = f"web_search:{role}" if role else "web_search"
+
         saved = 0
 
         logger.info(
-            "[WebSearch] Iniciando busca para tenant %s — %d tópicos",
+            "[WebSearch] Iniciando busca role=%s para tenant %s — %d tópicos",
+            role or "default",
             owner_id[:8],
             len(topics_to_search),
         )
@@ -174,11 +276,11 @@ class WebSearchService:
                     logger.debug("[WebSearch] Sem resultados para '%s'", topic)
                     continue
 
-                summary = self._summarize(topic, results)
+                summary = self._summarize(topic, results, role=role)
                 if not summary:
                     continue
 
-                content = f"[Tendência: {topic}]\n{summary}"
+                content = f"[{role_label}: {topic}]\n{summary}"
                 source_urls = " | ".join(
                     r["url"] for r in results[:3] if r.get("url")
                 )
@@ -187,16 +289,17 @@ class WebSearchService:
                     owner_id=owner_id,
                     topic=topic,
                     content=content,
-                    source=f"web_search | {source_urls[:180]}",
+                    source=f"{source_prefix} | {source_urls[:180]}",
                     confidence=0.7,
                 )
 
                 if result.get("ok"):
                     saved += 1
-                    action = result.get("action", "salvo")  # "updated" ou "created"
+                    action = result.get("action", "salvo")
                     logger.info(
-                        "[WebSearch] ✓ %s: '%s'",
+                        "[WebSearch] ✓ %s [%s]: '%s'",
                         "Atualizado" if action == "updated" else "Criado",
+                        role_label,
                         topic[:60],
                     )
                 else:
@@ -210,7 +313,8 @@ class WebSearchService:
                 logger.error("[WebSearch] Erro no tópico '%s': %s", topic, e)
 
         logger.info(
-            "[WebSearch] Concluído para tenant %s — %d/%d tópicos processados",
+            "[WebSearch] Concluído role=%s tenant %s — %d/%d tópicos processados",
+            role or "default",
             owner_id[:8],
             saved,
             len(topics_to_search),
