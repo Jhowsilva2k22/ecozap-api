@@ -170,11 +170,12 @@ class QualifierAgent:
         media_base64 = None
 
         # Extrai caption limpo de imagens (remove prefixo "[Imagem]: " do parse_webhook)
+        # Se imagem sem legenda, usa texto descritivo para não passar string vazia ao AI
         if media_type == "image":
             if ": " in message:
                 display_message = message.split(": ", 1)[1]
             elif message.startswith("[Imagem"):
-                display_message = ""
+                display_message = "[Imagem recebida]"
 
         if media_type in ("image", "audio", "document") and message_id:
             media_base64 = await sender.download_media(message_id, phone=phone, channel=ch, instance=evolution_instance)
@@ -308,9 +309,14 @@ class QualifierAgent:
                 system_prompt=system_prompt, history=history,
                 user_message=display_message, use_gemini=is_simple)
 
-        # Guard: AI pode retornar None/vazio em casos de erro — evita crash em len(response)
+        # Guard: AI retornou None/vazio (erro na API) — envia fallback natural ao lead
+        # Antes: bot ficava silencioso, lead sem resposta, histórico inconsistente
         if not response:
-            logger.warning(f"[Qualifier] Resposta vazia do AI para {phone} | media={media_type}")
+            logger.warning(f"[Qualifier] Resposta vazia do AI para {phone} | media={media_type} — enviando fallback")
+            fallback = "Hmm, tive um problema aqui. Pode repetir o que você disse?"
+            await self.memory.save_turn(phone, owner_id, "assistant", fallback)
+            await sender.send_typing(phone, channel=ch, duration=1500, instance=evolution_instance)
+            await sender.send_message(phone, fallback, channel=ch, instance=evolution_instance)
             return
 
         await self.memory.save_turn(phone, owner_id, "assistant", response)
