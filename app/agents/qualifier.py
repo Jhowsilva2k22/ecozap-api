@@ -144,8 +144,14 @@ class QualifierAgent:
         # Canal do lead (whatsapp ou instagram)
         ch = customer.channel or "whatsapp"
 
+        # Carrega histórico ANTES da verificação de primeiro contato
+        # Evita disparar welcome_message se total_messages ficou zerado por falha de PATCH
+        history = await self.memory.get_conversation_history(phone, owner_id)
+
         # ── Boas-vindas no primeiro contato ─────────────────────────────────
-        is_first_contact = (customer.total_messages or 0) == 0
+        # Primeiro contato REAL: sem mensagens no histórico E total_messages == 0
+        # Antes: só verificava total_messages → welcome disparava de novo se PATCH falhasse
+        is_first_contact = (customer.total_messages or 0) == 0 and len(history) == 0
         welcome_msg = (owner.get("welcome_message") or "")
         if is_first_contact and welcome_msg:
             final_welcome = welcome_msg.replace("{nome}", customer.name or "")
@@ -153,8 +159,6 @@ class QualifierAgent:
             await sender.send_typing(phone, channel=ch, duration=len(final_welcome) * 40, instance=evolution_instance)
             await sender.send_message(phone, final_welcome, channel=ch, instance=evolution_instance)
             await self.memory.save_turn(phone, owner_id, "assistant", final_welcome)
-
-        history = await self.memory.get_conversation_history(phone, owner_id)
 
         # ── Knowledge Bank: contexto de conhecimento treinado ───────────────
         knowledge_context = ""
@@ -310,7 +314,6 @@ class QualifierAgent:
                 user_message=display_message, use_gemini=is_simple)
 
         # Guard: AI retornou None/vazio (erro na API) — envia fallback natural ao lead
-        # Antes: bot ficava silencioso, lead sem resposta, histórico inconsistente
         if not response:
             logger.warning(f"[Qualifier] Resposta vazia do AI para {phone} | media={media_type} — enviando fallback")
             fallback = "Hmm, tive um problema aqui. Pode repetir o que você disse?"
