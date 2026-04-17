@@ -413,7 +413,7 @@ def follow_up_cold_leads(self):
                 continue
 
             try:
-                resp = db.table("customers").select("phone, name, first_name").eq(
+                resp = db.table("customers").select("phone, name").eq(
                     "owner_id", owner_id
                 ).lt(
                     "last_contact", cold_threshold.isoformat()
@@ -431,7 +431,7 @@ def follow_up_cold_leads(self):
 
                 for lead in cold_leads:
                     try:
-                        name = lead.get("first_name") or lead.get("name") or "você"
+                        name = lead.get("name") or "você"
                         msg = f"Oi {name}! Faz um tempo que não conversamos. Posso te ajudar com algo? 😊"
                         run_async(wa_svc.send_message(lead["phone"], msg, instance=evolution_instance))
                     except Exception as e:
@@ -490,7 +490,7 @@ def nurture_customers(self):
                 continue
 
             try:
-                resp = db.table("customers").select("phone, name, first_name").eq(
+                resp = db.table("customers").select("phone, name").eq(
                     "owner_id", owner_id
                 ).eq(
                     "lead_status", "cliente"
@@ -506,7 +506,7 @@ def nurture_customers(self):
 
                 for customer in customers:
                     try:
-                        name = customer.get("first_name") or customer.get("name") or "você"
+                        name = customer.get("name") or "você"
                         msg = f"Olá {name}! Obrigado por ser cliente! Quer conhecer nossas novidades? ✨"
                         run_async(wa_svc.send_message(customer["phone"], msg, instance=evolution_instance))
                     except Exception as e:
