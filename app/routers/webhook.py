@@ -63,6 +63,9 @@ async def receive_whatsapp(request: Request):
     if not owner:
         return {"status": "owner_not_found"}
 
+    # ── Instância Evolution correta para este owner (multi-tenant) ───────────
+    evolution_instance = owner.get("evolution_instance") or message.instance
+
     owner_phone = _normalize_phone(owner.get("phone", ""))
     sender_phone = _normalize_phone(message.phone)
     msg_raw = message.message or ""
@@ -78,7 +81,8 @@ async def receive_whatsapp(request: Request):
                 learn_from_links.apply_async(args=[owner["id"], links], queue="learning")
                 await whatsapp.send_message(
                     message.phone,
-                    f"📚 Recebi {len(links)} link(s)! Vou processar e aprender. Pode levar até 2 minutos."
+                    f"📚 Recebi {len(links)} link(s)! Vou processar e aprender. Pode levar até 2 minutos.",
+                    instance=evolution_instance
                 )
             return {"status": "learning_queued"}
 
@@ -102,7 +106,7 @@ async def receive_whatsapp(request: Request):
             note_text = _extract_note(msg_raw)
             if lead_phone and note_text:
                 await _save_owner_note(lead_phone, owner, note_text)
-                await whatsapp.send_message(message.phone, "✅ Anotação salva no perfil do lead.")
+                await whatsapp.send_message(message.phone, "✅ Anotação salva no perfil do lead.", instance=evolution_instance)
                 return {"status": "note_saved"}
 
         # BOAS-VINDAS: dono configura mensagem de boas-vindas
@@ -115,14 +119,16 @@ async def receive_whatsapp(request: Request):
                         message.phone,
                         f"✅ Mensagem de boas-vindas atualizada!\n\n"
                         f"Preview:\n_{welcome_text}_\n\n"
-                        f"Variáveis disponíveis: {{nome}}, {{negocio}}"
+                        f"Variáveis disponíveis: {{nome}}, {{negocio}}",
+                        instance=evolution_instance
                     )
                 except Exception as e:
                     logger.error(f"[Webhook] Erro ao salvar welcome: {e}")
                     await whatsapp.send_message(
                         message.phone,
                         "⚠️ Erro ao salvar. Rode no Supabase:\n"
-                        "ALTER TABLE owners ADD COLUMN welcome_message TEXT DEFAULT '';"
+                        "ALTER TABLE owners ADD COLUMN welcome_message TEXT DEFAULT '';",
+                        instance=evolution_instance
                     )
                 return {"status": "welcome_updated"}
 
@@ -141,48 +147,49 @@ async def receive_whatsapp(request: Request):
                         message.phone,
                         f"✅ *{lead_name}* marcado como cliente!\n\n"
                         f"O agente agora vai cuidar do relacionamento: check-in semanal, "
-                        f"aniversário e novidades relevantes."
+                        f"aniversário e novidades relevantes.",
+                        instance=evolution_instance
                     )
                     logger.info(f"[Webhook] {lead_phone} marcado como cliente por {owner['id']}")
                 except Exception as e:
                     logger.error(f"[Webhook] Erro ao marcar cliente: {e}")
-                    await whatsapp.send_message(message.phone, "⚠️ Erro ao marcar como cliente.")
+                    await whatsapp.send_message(message.phone, "⚠️ Erro ao marcar como cliente.", instance=evolution_instance)
                 return {"status": "client_marked"}
 
         # STATS: resumo rápido do dia
         if msg_lower in STATS_CMDS:
             try:
                 stats_msg = await _build_owner_stats(owner["id"])
-                await whatsapp.send_message(message.phone, stats_msg)
+                await whatsapp.send_message(message.phone, stats_msg, instance=evolution_instance)
             except Exception as e:
                 logger.error(f"[Webhook] Erro ao gerar stats: {e}")
-                await whatsapp.send_message(message.phone, "⚠️ Erro ao gerar relatório.")
+                await whatsapp.send_message(message.phone, "⚠️ Erro ao gerar relatório.", instance=evolution_instance)
             return {"status": "stats_sent"}
 
         # RELATÓRIO SEMANAL: análise completa com IA
         if msg_lower in REPORT_CMDS:
             try:
-                await whatsapp.send_message(message.phone, "📊 Gerando relatório semanal com análise completa... pode levar até 1 minuto.")
+                await whatsapp.send_message(message.phone, "📊 Gerando relatório semanal com análise completa... pode levar até 1 minuto.", instance=evolution_instance)
                 weekly_report.apply_async(queue="learning")
             except Exception as e:
                 logger.error(f"[Webhook] Erro ao agendar relatório: {e}")
-                await whatsapp.send_message(message.phone, "⚠️ Erro ao gerar relatório.")
+                await whatsapp.send_message(message.phone, "⚠️ Erro ao gerar relatório.", instance=evolution_instance)
             return {"status": "report_queued"}
 
         # RECALCULAR: recalcula scores de todos os leads
         if msg_lower in RECALC_CMDS:
             try:
-                await whatsapp.send_message(message.phone, "🔄 Recalculando scores de todos os leads... pode levar alguns minutos.")
+                await whatsapp.send_message(message.phone, "🔄 Recalculando scores de todos os leads... pode levar alguns minutos.", instance=evolution_instance)
                 recalculate_scores.apply_async(args=[owner["id"]], queue="learning")
             except Exception as e:
                 logger.error(f"[Webhook] Erro ao agendar recálculo: {e}")
-                await whatsapp.send_message(message.phone, "⚠️ Erro ao iniciar recálculo.")
+                await whatsapp.send_message(message.phone, "⚠️ Erro ao iniciar recálculo.", instance=evolution_instance)
             return {"status": "recalc_queued"}
 
         # PAINEL: envia link direto pro painel autenticado
         if msg_lower in PANEL_CMDS:
             panel = _panel_url()
-            await whatsapp.send_message(message.phone, f"📊 Acesse seu painel:\n👉 {panel}")
+            await whatsapp.send_message(message.phone, f"📊 Acesse seu painel:\n👉 {panel}", instance=evolution_instance)
             return {"status": "panel_sent"}
 
         # GOOGLE CALENDAR: inicia OAuth para conectar Google Calendar + Gmail
@@ -199,7 +206,8 @@ async def receive_whatsapp(request: Request):
                 f"🔗 *Conectar Google Calendar + Gmail*\n\n"
                 f"Clique no link e autorize o EcoZap a acessar sua agenda:\n\n"
                 f"{oauth_url}\n\n"
-                f"Após autorizar, você recebe a confirmação aqui."
+                f"Após autorizar, você recebe a confirmação aqui.",
+                instance=evolution_instance
             )
             return {"status": "google_oauth_sent"}
 
@@ -207,10 +215,9 @@ async def receive_whatsapp(request: Request):
         campaign_key = f"campaign_wizard:{owner['id']}"
         campaign_state = _redis.hgetall(campaign_key)
 
-        # /campanha inicia o wizard
         if msg_lower.strip() in ("/campanha", "/campanha:"):
             _redis.hset(campaign_key, mapping={"step": "publico"})
-            _redis.expire(campaign_key, 600)  # 10 min timeout
+            _redis.expire(campaign_key, 600)
             await whatsapp.send_message(message.phone,
                 "📢 *Vamos criar sua campanha!*\n\n"
                 "Primeiro, pra quem é?\n\n"
@@ -218,54 +225,45 @@ async def receive_whatsapp(request: Request):
                 "2️⃣ Só mornos pra cima (score 40+)\n"
                 "3️⃣ Só quentes (score 70+)\n"
                 "4️⃣ Só clientes\n\n"
-                "Responda com o número ou descreva (ex: 'mornos e quentes')"
+                "Responda com o número ou descreva (ex: 'mornos e quentes')",
+                instance=evolution_instance
             )
             return {"status": "campaign_step_publico"}
 
-        # Wizard ativo — processa resposta
         if campaign_state and campaign_state.get("step"):
             step = campaign_state["step"]
 
-            # PASSO 1: Público
             if step == "publico":
-                # Parseia público
                 pub = msg_lower.strip()
                 if pub in ("1", "todos", "todos os leads"):
-                    target = "todos"
-                    target_label = "todos os leads"
+                    target = "todos"; target_label = "todos os leads"
                 elif pub in ("2", "mornos", "mornos pra cima", "morno"):
-                    target = "mornos+"
-                    target_label = "mornos pra cima (score 40+)"
+                    target = "mornos+"; target_label = "mornos pra cima (score 40+)"
                 elif pub in ("3", "quentes", "quente", "quentes pra cima"):
-                    target = "quentes"
-                    target_label = "quentes (score 70+)"
+                    target = "quentes"; target_label = "quentes (score 70+)"
                 elif pub in ("4", "clientes", "cliente"):
-                    target = "clientes"
-                    target_label = "clientes"
+                    target = "clientes"; target_label = "clientes"
                 else:
-                    target = pub
-                    target_label = pub
+                    target = pub; target_label = pub
 
                 _redis.hset(campaign_key, mapping={"step": "descricao", "target": target, "target_label": target_label})
                 _redis.expire(campaign_key, 600)
                 await whatsapp.send_message(message.phone,
                     f"👥 Público: *{target_label}*\n\n"
                     "Agora me diz: sobre o que é a campanha?\n\n"
-                    "Descreva em 1-2 frases (ex: 'lançamento do curso de educação financeira, tom de urgência com exclusividade')"
+                    "Descreva em 1-2 frases (ex: 'lançamento do curso de educação financeira, tom de urgência com exclusividade')",
+                    instance=evolution_instance
                 )
                 return {"status": "campaign_step_descricao"}
 
-            # PASSO 2: Descrição
             if step == "descricao":
                 descricao = msg_raw.strip()
                 target = campaign_state.get("target", "todos")
                 target_label = campaign_state.get("target_label", "todos")
 
-                # Conta leads elegíveis pra dar preview
                 from app.database import get_db
                 db = get_db()
                 query = db.table("customers").select("phone,nurture_paused,total_messages,lead_status,lead_score").eq("owner_id", owner["id"])
-
                 if target == "clientes":
                     query = query.eq("lead_status", "cliente")
                 elif target == "quentes":
@@ -284,11 +282,11 @@ async def receive_whatsapp(request: Request):
                     f"📝 Tema: {descricao[:150]}\n"
                     f"📊 Leads que vão receber: *{leads_count}*\n\n"
                     f"A IA vai personalizar cada mensagem com nome e histórico do lead.\n\n"
-                    f"Responda *sim* pra disparar ou *não* pra cancelar."
+                    f"Responda *sim* pra disparar ou *não* pra cancelar.",
+                    instance=evolution_instance
                 )
                 return {"status": "campaign_step_confirmar"}
 
-            # PASSO 3: Confirmação
             if step == "confirmar":
                 if msg_lower.strip() in ("sim", "s", "yes", "bora", "vai", "manda", "confirmar", "ok"):
                     target = campaign_state.get("target", "todos")
@@ -300,13 +298,14 @@ async def receive_whatsapp(request: Request):
                     await whatsapp.send_message(message.phone,
                         "🚀 *Campanha iniciada!*\n\n"
                         "Gerando mensagens personalizadas e disparando...\n"
-                        "Você recebe o relatório quando terminar."
+                        "Você recebe o relatório quando terminar.",
+                        instance=evolution_instance
                     )
                     run_campaign.apply_async(args=[owner["id"], campaign_full], queue="learning")
                     return {"status": "campaign_started"}
                 else:
                     _redis.delete(campaign_key)
-                    await whatsapp.send_message(message.phone, "❌ Campanha cancelada.")
+                    await whatsapp.send_message(message.phone, "❌ Campanha cancelada.", instance=evolution_instance)
                     return {"status": "campaign_cancelled"}
 
         # ── TRAINER: treinar o atendente pelo WhatsApp ───────────────────────
@@ -336,7 +335,7 @@ async def receive_whatsapp(request: Request):
             except Exception as e:
                 logger.error(f"[Webhook] Trainer falhou: {e}")
                 reply = "⚠️ Erro ao processar o comando. Tente novamente."
-            await whatsapp.send_message(message.phone, reply)
+            await whatsapp.send_message(message.phone, reply, instance=evolution_instance)
             return {"status": "trainer_processed"}
 
         # AJUDA: lista todos os comandos disponíveis
@@ -367,26 +366,24 @@ async def receive_whatsapp(request: Request):
                 "/conectar_google — conectar Google Calendar e Gmail\n"
                 "/ajuda — ver esta lista"
             )
-            await whatsapp.send_message(message.phone, help_msg)
+            await whatsapp.send_message(message.phone, help_msg, instance=evolution_instance)
             return {"status": "help_sent"}
 
     # ── Bloqueia bot se lead está em atendimento humano ──────────────────────
     if sender_phone != owner_phone:
         customer = await memory.get_or_create_customer(message.phone, owner["id"])
         if customer.lead_status == "em_atendimento_humano":
-            # Verifica se é dia seguinte — se sim, retoma o bot automaticamente
             if _is_next_day(customer.last_contact):
                 await memory.update_customer(
                     message.phone, owner["id"],
                     {"lead_status": "qualificando"}
                 )
                 logger.info(f"[Webhook] Bot retomado automaticamente para {message.phone} (dia seguinte)")
-                # Deixa cair no fluxo normal abaixo
             else:
                 logger.info(f"[Webhook] Ignorado — lead {message.phone} em atendimento humano")
                 return {"status": "in_human_handoff"}
 
-    # ── Tracking de follow-up: marca timestamp + reseta estágio frio ────────
+    # ── Tracking de follow-up ────────────────────────────────────────────────
     if sender_phone != owner_phone:
         import time as _time
         ts_key = f"last_lead_msg:{message.phone}:{owner['id']}"
@@ -394,21 +391,17 @@ async def receive_whatsapp(request: Request):
         fu_task_key = f"followup_task:{message.phone}:{owner['id']}"
         try:
             _redis.set(ts_key, str(_time.time()))
-            _redis.expire(ts_key, 1800)  # TTL 30min
-            _redis.delete(fu_key)  # reseta follow-up ativo ao receber msg
+            _redis.expire(ts_key, 1800)
+            _redis.delete(fu_key)
 
-            # Reseta follow_up_stage e nurture_paused se lead/cliente voltou a responder
             reset_fields = {}
             if hasattr(customer, 'follow_up_stage') and (customer.follow_up_stage or 0) > 0:
                 reset_fields["follow_up_stage"] = 0
             if hasattr(customer, 'nurture_paused') and customer.nurture_paused:
                 reset_fields["nurture_paused"] = False
             if reset_fields:
-                await memory.update_customer(
-                    message.phone, owner["id"], reset_fields
-                )
+                await memory.update_customer(message.phone, owner["id"], reset_fields)
 
-            # Revoga follow-up ativo anterior (se existir)
             old_fu = _redis.get(fu_task_key)
             if old_fu:
                 celery_app.control.revoke(old_fu, terminate=False)
@@ -416,7 +409,7 @@ async def receive_whatsapp(request: Request):
         except Exception as e:
             logger.warning(f"[Webhook] Follow-up tracking falhou (continuando): {e}")
 
-    # ── Billing: checa limite de mensagens do plano ───────────────────────
+    # ── Billing: checa limite de mensagens do plano ───────────────────────────
     if sender_phone != owner_phone:
         try:
             from app.middleware.billing import BillingMiddleware
@@ -434,16 +427,14 @@ async def receive_whatsapp(request: Request):
 
     try:
         import json as _json
-        # Adiciona mensagem ao buffer (lista no Redis)
         msg_data = _json.dumps({
             "text": message.message or "",
             "message_id": message.message_id or "",
             "media_type": message.media_type or "text"
         })
         _redis.rpush(buffer_key, msg_data)
-        _redis.expire(buffer_key, 30)  # TTL de segurança
+        _redis.expire(buffer_key, 30)
 
-        # Revoga task anterior (se existir) e agenda nova com delay
         old_task_id = _redis.get(task_key)
         if old_task_id:
             celery_app.control.revoke(old_task_id, terminate=False)
@@ -455,12 +446,11 @@ async def receive_whatsapp(request: Request):
         )
         _redis.setex(task_key, 30, result.id)
 
-        # ── Agenda follow-up ativo (5 min) para leads ──────────────────────
         if sender_phone != owner_phone:
             fu_task_key = f"followup_task:{message.phone}:{owner['id']}"
             fu_result = follow_up_active.apply_async(
                 args=[message.phone, owner["id"], 1],
-                countdown=300,  # 5 minutos
+                countdown=300,
                 queue="messages"
             )
             _redis.setex(fu_task_key, 600, fu_result.id)
@@ -487,29 +477,27 @@ async def _owner_assumes(lead_phone: str, owner: dict, raw_msg: str):
     """Dono assume atendimento: marca lead, envia despedida natural ao lead."""
     owner_id = owner["id"]
     owner_name = owner.get("business_name", "a equipe")
+    evolution_instance = owner.get("evolution_instance") or ""
 
-    # Nome para a despedida — pega primeiro nome do business_name
     first_name = owner_name.split()[0] if owner_name else "eu"
 
     customer = await memory.get_or_create_customer(lead_phone, owner_id)
     customer_name = customer.name or ""
 
-    # Marca lead como em atendimento humano
     await memory.update_customer(lead_phone, owner_id, {"lead_status": "em_atendimento_humano"})
 
-    # Despedida natural ao lead
     greeting = f"{customer_name}, " if customer_name else ""
     farewell = (
         f"{greeting}o {first_name} vai falar com você agora em instantes. "
         f"Foi ótimo conversar contigo 😊"
     )
-    await whatsapp.send_message(lead_phone, farewell)
+    await whatsapp.send_message(lead_phone, farewell, instance=evolution_instance)
 
-    # Confirma pro dono com relatório do lead
     report = await _build_lead_report(customer, lead_phone)
     await whatsapp.send_message(
         _normalize_phone(owner.get("phone", "")),
-        f"✅ Pronto! Avisei o lead. Aqui está o resumo:\n\n{report}"
+        f"✅ Pronto! Avisei o lead. Aqui está o resumo:\n\n{report}",
+        instance=evolution_instance
     )
     logger.info(f"[Handoff] {lead_phone} assumido pelo dono")
 
@@ -517,10 +505,12 @@ async def _owner_assumes(lead_phone: str, owner: dict, raw_msg: str):
 async def _owner_resumes(lead_phone: str, owner: dict):
     """Dono devolve lead pro bot."""
     owner_id = owner["id"]
+    evolution_instance = owner.get("evolution_instance") or ""
     await memory.update_customer(lead_phone, owner_id, {"lead_status": "qualificando"})
     await whatsapp.send_message(
         _normalize_phone(owner.get("phone", "")),
-        f"🤖 Bot retomado para {lead_phone}. Ele vai cuidar desse lead de agora em diante."
+        f"🤖 Bot retomado para {lead_phone}. Ele vai cuidar desse lead de agora em diante.",
+        instance=evolution_instance
     )
     logger.info(f"[Handoff] {lead_phone} devolvido ao bot")
 
@@ -549,7 +539,6 @@ async def _build_owner_stats(owner_id: str) -> str:
     hot = [l for l in leads if (l.get("lead_score") or 0) >= 70]
     human = [l for l in leads if l.get("lead_status") == "em_atendimento_humano"]
 
-    # Top 3 leads por score
     top = sorted(leads, key=lambda x: x.get("lead_score") or 0, reverse=True)[:3]
     top_text = ""
     for i, l in enumerate(top, 1):
@@ -557,7 +546,6 @@ async def _build_owner_stats(owner_id: str) -> str:
         score = l.get("lead_score") or 0
         top_text += f"  {i}. {name} — {score} pts\n"
 
-    # Canais
     channels = {}
     for l in leads:
         c = l.get("channel") or "não identificado"
@@ -578,7 +566,6 @@ async def _build_owner_stats(owner_id: str) -> str:
     if ch_text:
         msg += f"📍 *Canais:* {ch_text}\n\n"
 
-    # Leads ativos hoje
     if today_leads:
         msg += f"💬 *Ativos hoje:*\n"
         for l in today_leads[:5]:
@@ -610,7 +597,6 @@ async def _build_lead_report(customer, phone: str) -> str:
 
 
 def _is_next_day(last_contact) -> bool:
-    """Retorna True se o último contato foi em um dia diferente do atual."""
     if not last_contact:
         return False
     from datetime import datetime, timezone
@@ -638,7 +624,6 @@ def _normalize_phone(phone: str) -> str:
 
 
 def _extract_phone(text: str) -> str:
-    """Extrai número de telefone de um texto como 'assumir 5513999...'"""
     digits = re.findall(r'[\d\s\-\+\(\)]{8,}', text)
     for d in digits:
         clean = re.sub(r'\D', '', d)
@@ -648,15 +633,12 @@ def _extract_phone(text: str) -> str:
 
 
 def _extract_note(text: str) -> str:
-    """Remove o prefixo e o número, retorna o texto da nota."""
-    # Remove prefixo tipo "/nota 5513999... texto aqui"
     cleaned = re.sub(r'^/?(nota|anotacao|anotação)\s+', '', text.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r'^\+?[\d\s\-\(\)]{8,}\s*', '', cleaned).strip()
     return cleaned
 
 
 def _extract_after_prefix(text: str, prefixes: tuple) -> str:
-    """Remove o prefixo do texto e retorna o restante."""
     lower = text.lower().strip()
     for p in prefixes:
         if lower.startswith(p):
