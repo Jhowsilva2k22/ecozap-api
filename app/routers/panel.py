@@ -151,6 +151,59 @@ async def export_leads(token: str = Query(...), owner_id: str = Query("")):
     )
 
 
+# ── Knowledge Bank API ───────────────────────────────────────────────────────
+
+@router.get("/panel/knowledge")
+async def list_knowledge(
+    token: str = Query(...),
+    owner_id: str = Query(""),
+    category: str = Query(""),
+    search: str = Query(""),
+    limit: int = Query(100),
+):
+    _check_token(token)
+    db = memory.db
+    q = db.table("knowledge_items").select("*").order("created_at", desc=True).limit(limit)
+    if owner_id:
+        q = q.eq("owner_id", owner_id)
+    if category:
+        q = q.eq("category", category)
+    result = q.execute()
+    items = result.data or []
+    if search:
+        s = search.lower()
+        items = [i for i in items if s in (i.get("content") or "").lower()]
+    return items
+
+
+@router.post("/panel/knowledge")
+async def add_knowledge(request: Request, token: str = Query(...)):
+    _check_token(token)
+    body = await request.json()
+    owner_id = body.get("owner_id", "")
+    category = body.get("category", "faq")
+    content  = body.get("content", "").strip()
+    source   = body.get("source", "painel")
+    if not owner_id or not content:
+        raise HTTPException(status_code=400, detail="owner_id e content são obrigatórios")
+    try:
+        from app.services.knowledge import KnowledgeBank
+        kb = KnowledgeBank()
+        result = kb.add_item(owner_id, category, content, source=source)
+        return result
+    except Exception as e:
+        logger.error(f"[Panel KB] add error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/panel/knowledge/{item_id}")
+async def delete_knowledge(item_id: str, token: str = Query(...)):
+    _check_token(token)
+    db = memory.db
+    db.table("knowledge_items").delete().eq("id", item_id).execute()
+    return {"ok": True, "deleted": item_id}
+
+
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
 
 @router.get("/panel", response_class=HTMLResponse)
@@ -158,6 +211,12 @@ async def dashboard(token: str = Query(...)):
     _check_token(token)
     html = _build_html(token)
     return HTMLResponse(content=html)
+
+
+@router.get("/panel/knowledge-ui", response_class=HTMLResponse)
+async def knowledge_ui(token: str = Query(...)):
+    _check_token(token)
+    return HTMLResponse(content=_build_knowledge_html(token))
 
 
 def _build_html(token: str) -> str:
@@ -269,8 +328,12 @@ def _build_html(token: str) -> str:
 <body>
 
 <div class="header">
-  <h1>Painel de Leads</h1>
-  <span id="last-update"></span>
+  <h1>⚡ EcoZap</h1>
+  <nav style="display:flex;gap:6px;margin-left:16px">
+    <a href="/panel?token={token}" style="background:#252525;border:1px solid #333;border-radius:8px;padding:5px 14px;color:#fff;font-size:13px;text-decoration:none;font-weight:600">Leads</a>
+    <a href="/panel/knowledge-ui?token={token}" style="background:transparent;border:1px solid #2a2a2a;border-radius:8px;padding:5px 14px;color:#888;font-size:13px;text-decoration:none">Conhecimento</a>
+  </nav>
+  <span id="last-update" style="margin-left:auto"></span>
 </div>
 
 <div class="stats" id="stats-row">
@@ -416,6 +479,12 @@ function scoreClass(s) {{
   return 'cold';
 }}
 
+function tempIcon(s) {{
+  if (s >= 50) return '🔥';
+  if (s >= 20) return '🌡️';
+  return '❄️';
+}}
+
 function sentimentIcon(s) {{
   const map = {{positivo:'Positivo',entusiasmado:'Entusiasmado',neutro:'Neutro',negativo:'Negativo',frustrado:'Frustrado'}};
   return map[s] || '—';
@@ -438,7 +507,7 @@ function renderLeads(leads) {{
     <tr onclick="openLead('${{l.phone}}','${{l.owner_id}}')">
       <td class="name">${{l.name || '—'}}</td>
       <td class="phone"><a href="https://wa.me/${{(l.phone||'').replace(/[^0-9]/g,'')}}" target="_blank" onclick="event.stopPropagation()">${{l.phone}}</a></td>
-      <td><span class="score ${{scoreClass(l.lead_score||0)}}">${{l.lead_score||0}}</span></td>
+      <td><span class="score ${{scoreClass(l.lead_score||0)}}">${{tempIcon(l.lead_score||0)}} ${{l.lead_score||0}}</span></td>
       <td><span class="badge ${{l.lead_status||'novo'}}">${{l.lead_status||'novo'}}</span></td>
       <td><span class="sentiment ${{l.last_sentiment||'neutro'}}">${{sentimentIcon(l.last_sentiment)}}</span></td>
       <td class="ch">${{l.channel||'—'}}</td>
@@ -506,6 +575,279 @@ loadStats();
 loadLeads();
 // Atualiza a cada 60 segundos
 setInterval(() => {{ loadStats(); loadLeads(); }}, 60000);
+</script>
+</body>
+</html>"""
+
+
+def _build_knowledge_html(token: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conhecimento — EcoZap</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; }}
+  .header {{ background: #1a1a1a; border-bottom: 1px solid #2a2a2a; padding: 16px 24px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }}
+  .header h1 {{ font-size: 18px; font-weight: 600; color: #fff; }}
+  nav a {{ background:transparent; border:1px solid #2a2a2a; border-radius:8px; padding:5px 14px; color:#888; font-size:13px; text-decoration:none; }}
+  nav a.active {{ background:#252525; border-color:#333; color:#fff; font-weight:600; }}
+  .toolbar {{ padding: 16px 24px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+  .toolbar input, .toolbar select {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 8px 14px; color: #e0e0e0; font-size: 14px; outline: none; }}
+  .toolbar input {{ width: 260px; }}
+  .toolbar input:focus, .toolbar select:focus {{ border-color: #444; }}
+  .btn-add {{ background: #25a244; border: none; border-radius: 8px; padding: 8px 18px; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; margin-left: auto; }}
+  .btn-add:hover {{ background: #2db84e; }}
+  .content {{ flex: 1; overflow-y: auto; padding: 0 24px 32px; }}
+  .cat-section {{ margin-bottom: 28px; }}
+  .cat-title {{ font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #555; font-weight: 700; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }}
+  .cat-count {{ background: #1e1e1e; border: 1px solid #2a2a2a; border-radius: 10px; padding: 1px 8px; font-size: 11px; color: #777; }}
+  .kb-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }}
+  .kb-card {{ background: #1a1a1a; border: 1px solid #222; border-radius: 10px; padding: 14px 16px; position: relative; }}
+  .kb-card:hover {{ border-color: #333; }}
+  .kb-card .content-text {{ font-size: 13px; color: #ccc; line-height: 1.6; padding-right: 28px; word-break: break-word; }}
+  .kb-card .meta {{ font-size: 11px; color: #444; margin-top: 8px; display: flex; gap: 12px; }}
+  .kb-card .meta span {{ display: flex; align-items: center; gap: 3px; }}
+  .kb-card .del-btn {{ position: absolute; top: 10px; right: 10px; background: none; border: none; color: #333; font-size: 16px; cursor: pointer; line-height: 1; padding: 2px 4px; border-radius: 4px; }}
+  .kb-card .del-btn:hover {{ background: #2a1515; color: #ef5350; }}
+  .conf-bar {{ display: inline-block; width: 40px; height: 4px; border-radius: 2px; background: #222; overflow: hidden; vertical-align: middle; margin-right: 2px; }}
+  .conf-fill {{ height: 100%; background: #25a244; border-radius: 2px; }}
+  .empty {{ text-align: center; padding: 60px; color: #444; font-size: 14px; }}
+  /* Modal de adição */
+  .modal-bg {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,.75); z-index: 100; align-items: center; justify-content: center; }}
+  .modal-bg.open {{ display: flex; }}
+  .modal {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; width: 520px; max-width: 95vw; padding: 28px; }}
+  .modal h2 {{ font-size: 16px; color: #fff; margin-bottom: 20px; }}
+  .modal label {{ font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: .5px; display: block; margin-bottom: 6px; }}
+  .modal select, .modal textarea {{ width: 100%; background: #111; border: 1px solid #2a2a2a; border-radius: 8px; padding: 10px 14px; color: #e0e0e0; font-size: 14px; outline: none; font-family: inherit; }}
+  .modal select {{ margin-bottom: 16px; }}
+  .modal textarea {{ min-height: 120px; resize: vertical; margin-bottom: 16px; line-height: 1.5; }}
+  .modal select:focus, .modal textarea:focus {{ border-color: #444; }}
+  .modal-footer {{ display: flex; gap: 10px; justify-content: flex-end; }}
+  .btn-cancel {{ background: none; border: 1px solid #2a2a2a; border-radius: 8px; padding: 9px 18px; color: #888; font-size: 14px; cursor: pointer; }}
+  .btn-cancel:hover {{ color: #fff; border-color: #444; }}
+  .btn-save {{ background: #25a244; border: none; border-radius: 8px; padding: 9px 20px; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }}
+  .btn-save:hover {{ background: #2db84e; }}
+  .cat-badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }}
+  .cat-produto {{ background:#1e2030; color:#7986cb; }}
+  .cat-faq {{ background:#1e2a30; color:#4fc3f7; }}
+  .cat-objecao {{ background:#2a1e1e; color:#ef9a9a; }}
+  .cat-estilo {{ background:#1e2a1e; color:#81c784; }}
+  .cat-expertise {{ background:#2a2510; color:#ffb74d; }}
+  .cat-concorrente {{ background:#2a1a2a; color:#ce93d8; }}
+  .cat-depoimento {{ background:#1a2a20; color:#80cbc4; }}
+  .cat-processo {{ background:#1e1e2a; color:#90caf9; }}
+  .cat-aprendizado {{ background:#2a2520; color:#ffcc80; }}
+  .stats-bar {{ padding: 0 24px 16px; display: flex; gap: 8px; flex-wrap: wrap; }}
+  .stat-chip {{ background: #1a1a1a; border: 1px solid #222; border-radius: 8px; padding: 8px 14px; }}
+  .stat-chip .sv {{ font-size: 20px; font-weight: 700; color: #fff; }}
+  .stat-chip .sl {{ font-size: 10px; color: #555; margin-top: 1px; text-transform: uppercase; }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>⚡ EcoZap</h1>
+  <nav style="display:flex;gap:6px;margin-left:16px">
+    <a href="/panel?token={token}">Leads</a>
+    <a href="/panel/knowledge-ui?token={token}" class="active">Conhecimento</a>
+  </nav>
+</div>
+
+<div class="toolbar">
+  <input type="text" id="kb-search" placeholder="Buscar no conhecimento..." oninput="filterKB()">
+  <select id="kb-cat" onchange="filterKB()">
+    <option value="">Todas as categorias</option>
+    <option value="produto">Produto / Serviço</option>
+    <option value="faq">FAQ</option>
+    <option value="objecao">Objeção</option>
+    <option value="estilo">Estilo / Tom</option>
+    <option value="expertise">Expertise</option>
+    <option value="concorrente">Concorrente</option>
+    <option value="depoimento">Depoimento</option>
+    <option value="processo">Processo</option>
+    <option value="aprendizado">Aprendizado</option>
+  </select>
+  <button class="btn-add" onclick="openModal()">+ Adicionar conhecimento</button>
+</div>
+
+<div class="stats-bar" id="kb-stats"></div>
+
+<div class="content" id="kb-content">
+  <div class="empty">Carregando...</div>
+</div>
+
+<!-- Modal de adição -->
+<div class="modal-bg" id="modal-bg" onclick="closeModal(event)">
+  <div class="modal">
+    <h2>Adicionar ao Conhecimento</h2>
+    <label>Categoria</label>
+    <select id="m-cat">
+      <option value="faq">FAQ — Pergunta e Resposta</option>
+      <option value="produto">Produto / Serviço</option>
+      <option value="objecao">Objeção — Como lidar</option>
+      <option value="estilo">Estilo / Tom de voz</option>
+      <option value="expertise">Expertise / Autoridade</option>
+      <option value="concorrente">Concorrente / Diferencial</option>
+      <option value="depoimento">Depoimento / Prova social</option>
+      <option value="processo">Processo / Contratação</option>
+      <option value="aprendizado">Aprendizado automático</option>
+    </select>
+    <label>Conteúdo</label>
+    <textarea id="m-content" placeholder="Ex: Pergunta: Quanto custa? | Resposta: O valor do plano básico é R$97/mês com 7 dias grátis."></textarea>
+    <div class="modal-footer">
+      <button class="btn-cancel" onclick="closeModal()">Cancelar</button>
+      <button class="btn-save" onclick="saveItem()">Salvar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = '{token}';
+let allItems = [];
+let ownerId = '';
+
+const CAT_LABELS = {{
+  produto: 'Produto / Serviço', faq: 'FAQ', objecao: 'Objeção',
+  estilo: 'Estilo / Tom', expertise: 'Expertise', concorrente: 'Concorrente',
+  depoimento: 'Depoimento', processo: 'Processo', aprendizado: 'Aprendizado'
+}};
+const CAT_ICONS = {{
+  produto:'📦', faq:'❓', objecao:'🛡️', estilo:'🎨',
+  expertise:'🏆', concorrente:'⚔️', depoimento:'💬', processo:'⚙️', aprendizado:'🤖'
+}};
+
+async function loadOwner() {{
+  const r = await fetch(`/panel/owners?token=${{TOKEN}}`);
+  const owners = await r.json();
+  if (owners.length > 0) ownerId = owners[0].id;
+}}
+
+async function loadKB() {{
+  if (!ownerId) return;
+  const r = await fetch(`/panel/knowledge?token=${{TOKEN}}&owner_id=${{ownerId}}&limit=500`);
+  allItems = await r.json();
+  renderStats();
+  filterKB();
+}}
+
+function renderStats() {{
+  const cats = {{}};
+  allItems.forEach(i => {{ cats[i.category] = (cats[i.category]||0) + 1; }});
+  const bar = document.getElementById('kb-stats');
+  bar.innerHTML = `
+    <div class="stat-chip"><div class="sv">${{allItems.length}}</div><div class="sl">Total</div></div>
+    ${{Object.entries(cats).sort((a,b)=>b[1]-a[1]).map(([cat, n]) =>
+      `<div class="stat-chip"><div class="sv">${{n}}</div><div class="sl">${{CAT_LABELS[cat]||cat}}</div></div>`
+    ).join('')}}
+  `;
+}}
+
+function filterKB() {{
+  const search = document.getElementById('kb-search').value.toLowerCase();
+  const cat = document.getElementById('kb-cat').value;
+  let items = allItems.filter(i => {{
+    if (cat && i.category !== cat) return false;
+    if (search && !(i.content||'').toLowerCase().includes(search)) return false;
+    return true;
+  }});
+  renderKB(items);
+}}
+
+function renderKB(items) {{
+  const el = document.getElementById('kb-content');
+  if (!items.length) {{
+    el.innerHTML = '<div class="empty">Nenhum conhecimento encontrado.<br><span style="font-size:12px;color:#333">Use /treinar no WhatsApp ou clique em "+ Adicionar" acima.</span></div>';
+    return;
+  }}
+  // Agrupa por categoria
+  const groups = {{}};
+  items.forEach(i => {{
+    if (!groups[i.category]) groups[i.category] = [];
+    groups[i.category].push(i);
+  }});
+  const order = ['produto','faq','objecao','estilo','expertise','concorrente','depoimento','processo','aprendizado'];
+  const sorted = [...order.filter(c => groups[c]), ...Object.keys(groups).filter(c => !order.includes(c))];
+  el.innerHTML = sorted.map(cat => `
+    <div class="cat-section">
+      <div class="cat-title">
+        ${{CAT_ICONS[cat]||'📌'}} ${{CAT_LABELS[cat]||cat}}
+        <span class="cat-count">${{groups[cat].length}}</span>
+      </div>
+      <div class="kb-grid">
+        ${{groups[cat].map(item => `
+          <div class="kb-card" id="card-${{item.id}}">
+            <button class="del-btn" onclick="deleteItem('${{item.id}}')" title="Remover">×</button>
+            <div class="content-text">${{escHtml(item.content)}}</div>
+            <div class="meta">
+              <span>
+                <span class="conf-bar"><span class="conf-fill" style="width:${{Math.round((item.confidence||1)*100)}}%"></span></span>
+                ${{Math.round((item.confidence||1)*100)}}%
+              </span>
+              <span>🔄 ${{item.times_used||0}}x usado</span>
+              <span>${{fmtDate(item.created_at)}}</span>
+            </div>
+          </div>
+        `).join('')}}
+      </div>
+    </div>
+  `).join('');
+}}
+
+function escHtml(str) {{
+  return (str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}}
+
+function fmtDate(d) {{
+  if (!d) return '';
+  const dt = new Date(d);
+  return dt.toLocaleDateString('pt-BR',{{day:'2-digit',month:'2-digit',year:'2-digit'}});
+}}
+
+async function deleteItem(id) {{
+  if (!confirm('Remover este conhecimento?')) return;
+  const card = document.getElementById('card-' + id);
+  if (card) card.style.opacity = '0.3';
+  const r = await fetch(`/panel/knowledge/${{id}}?token=${{TOKEN}}`, {{method:'DELETE'}});
+  if ((await r.json()).ok) {{
+    allItems = allItems.filter(i => i.id !== id);
+    renderStats();
+    filterKB();
+  }}
+}}
+
+function openModal() {{ document.getElementById('modal-bg').classList.add('open'); }}
+function closeModal(e) {{
+  if (!e || e.target === document.getElementById('modal-bg'))
+    document.getElementById('modal-bg').classList.remove('open');
+}}
+
+async function saveItem() {{
+  const cat = document.getElementById('m-cat').value;
+  const content = document.getElementById('m-content').value.trim();
+  if (!content) {{ alert('Escreva o conteúdo antes de salvar.'); return; }}
+  const btn = document.querySelector('.btn-save');
+  btn.textContent = 'Salvando...'; btn.disabled = true;
+  const r = await fetch(`/panel/knowledge?token=${{TOKEN}}`, {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{owner_id: ownerId, category: cat, content, source: 'painel'}})
+  }});
+  const res = await r.json();
+  btn.textContent = 'Salvar'; btn.disabled = false;
+  if (res.ok || res.id) {{
+    document.getElementById('m-content').value = '';
+    closeModal();
+    await loadKB();
+  }} else {{
+    alert('Erro ao salvar. Tente novamente.');
+  }}
+}}
+
+// Init
+loadOwner().then(loadKB);
 </script>
 </body>
 </html>"""
