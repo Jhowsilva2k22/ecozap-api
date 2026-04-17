@@ -178,9 +178,10 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
                     message_id: str = "", media_type: str = "text"):
     try:
         kwargs = {"message_id": message_id, "media_type": media_type}
-        _dispatch_to_agent(phone, owner_id, message, agent_mode, **kwargs)
+        # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
+        run_async(_dispatch_to_agent(phone, owner_id, message, agent_mode, **kwargs))
     except Exception as exc:
-        logger.error(f"Erro ao processar mensagem de {phone}: {exc}")
+        logger.error(f"Erro ao processar mensagem de {phone}: {exc}", exc_info=True)
         raise self.retry(exc=exc)
 
 
@@ -216,14 +217,16 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                 logger.info(f"[Buffer] Mensagens vazias de {phone}, ignorando")
                 return
             kwargs = {"message_id": msgs[-1].get("message_id", ""), "media_type": "text"}
-            _dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs)
+            # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
+            run_async(_dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs))
             return
 
         if len(media_msgs) == 1 and len(text_parts) <= 1:
             m = media_msgs[0]
             msg_text = text_parts[0] if text_parts else (m.get("text") or "")
             kwargs = {"message_id": m.get("message_id", ""), "media_type": m.get("media_type", "text")}
-            _dispatch_to_agent(phone, owner_id, msg_text, agent_mode, **kwargs)
+            # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
+            run_async(_dispatch_to_agent(phone, owner_id, msg_text, agent_mode, **kwargs))
             return
 
         from app.services.whatsapp import WhatsAppService
@@ -268,10 +271,11 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
             "message_id": last_msg.get("message_id", ""),
             "media_type": "text"
         }
-        _dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs)
+        # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
+        run_async(_dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs))
 
     except Exception as exc:
-        logger.error(f"Erro ao processar buffer de {phone}: {exc}")
+        logger.error(f"Erro ao processar buffer de {phone}: {exc}", exc_info=True)
         raise self.retry(exc=exc)
 
 
