@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 
 class CustomerProfile(BaseModel):
@@ -10,8 +10,12 @@ class CustomerProfile(BaseModel):
     name: Optional[str] = None
     first_name: Optional[str] = None
     email: Optional[str] = None
+    birthday: Optional[str] = None
     lead_score: Optional[int] = 0
     lead_status: Optional[str] = "qualificando"
+    last_intent: Optional[str] = None
+    last_sentiment: Optional[str] = None
+    sentiment_history: Optional[List[str]] = None
     channel: Optional[str] = None
     summary: Optional[str] = None
     total_messages: Optional[int] = 0
