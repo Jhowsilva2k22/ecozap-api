@@ -11,14 +11,13 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # ---------------------------------------------------------------------------
-# Sentry init pro worker Celery (Fase 1 — Observabilidade)
+# Sentry init pro worker Celery
 # ---------------------------------------------------------------------------
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
 if SENTRY_DSN:
     try:
         import sentry_sdk
         from sentry_sdk.integrations.celery import CeleryIntegration
-
         sentry_sdk.init(
             dsn=SENTRY_DSN,
             environment=os.getenv("APP_ENV", "production"),
@@ -32,35 +31,24 @@ if SENTRY_DSN:
 
 
 # ---------------------------------------------------------------------------
-# Decorator de alerta ops — agora com tracking, circuit breaker e auto-fix
+# Decorator de alerta ops
 # ---------------------------------------------------------------------------
 from app.services.alerts import notify_error  # noqa: E402
 
 
 def with_ops_alert(context_name: str):
-    """Decorator que:
-    1. Checa circuit breaker antes de executar
-    2. Rastreia sucesso/erro em Redis
-    3. Abre circuit breaker após 5 erros consecutivos
-    4. Tenta auto-fix para padrões conhecidos
-    5. Alerta via Telegram
-    """
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            # ── Circuit breaker check ──
             try:
                 from app.services.ops import is_circuit_open
                 if is_circuit_open(context_name):
-                    logger.warning("[Ops] Circuit aberto para %s — pulando execução", context_name)
+                    logger.warning("[Ops] Circuit aberto para %s — pulando", context_name)
                     return None
             except Exception:
-                pass  # se ops falhar, roda a task normalmente
-
-            # ── Execução ──
+                pass
             try:
                 result = fn(*args, **kwargs)
-                # Sucesso → reseta contador de erros
                 try:
                     from app.services.ops import track_success
                     track_success(context_name)
@@ -68,7 +56,6 @@ def with_ops_alert(context_name: str):
                     pass
                 return result
             except Exception as e:
-                # Erro → rastreia + alerta + re-raise pro Celery retry
                 try:
                     from app.services.ops import track_error
                     track_error(context_name, e)
@@ -84,10 +71,10 @@ def with_ops_alert(context_name: str):
 
 
 def _panel_url() -> str:
-    """Gera URL do painel já autenticada com token."""
     base = settings.app_url.rstrip("/")
     token = quote(settings.app_secret, safe="")
     return f"{base}/panel?token={token}"
+
 
 celery_app = Celery("whatsapp_agent", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
@@ -109,62 +96,57 @@ celery_app.conf.update(
         "app.queues.tasks.daily_backup": {"queue": "learning"},
         "app.queues.tasks.health_check": {"queue": "learning"},
         "app.queues.tasks.daily_ops_report": {"queue": "learning"},
-        "app.queues.tasks.daily_web_search": {"queue": "learning"},  # busca autônoma
+        "app.queues.tasks.daily_web_search": {"queue": "learning"},
     },
     beat_schedule={
-        # ── LEARNING: horário fixo, não reseta com deploy ──
         "nightly-learning-all": {
             "task": "app.queues.tasks.nightly_learning_all",
-            "schedule": crontab(hour=3, minute=0),  # 3:00 AM BRT diário
+            "schedule": crontab(hour=3, minute=0),
             "options": {"queue": "learning"},
         },
         "daily-web-search": {
             "task": "app.queues.tasks.daily_web_search",
-            "schedule": crontab(hour=6, minute=0),  # 6:00 AM BRT diário — após o learning noturno
+            "schedule": crontab(hour=6, minute=0),
             "options": {"queue": "learning"},
         },
-        # ── MENSAGENS: intervalos curtos (ok resetar) ──
         "follow-up-cold-leads": {
             "task": "app.queues.tasks.follow_up_cold_leads",
-            "schedule": 3600.0,  # a cada 1h
+            "schedule": 3600.0,
             "options": {"queue": "messages"},
         },
         "nurture-customers": {
             "task": "app.queues.tasks.nurture_customers",
-            "schedule": crontab(hour="8,20", minute=0),  # 8h e 20h BRT
+            "schedule": crontab(hour="8,20", minute=0),
             "options": {"queue": "messages"},
         },
-        # ── RELATÓRIOS: horários fixos ──
         "weekly-report": {
             "task": "app.queues.tasks.weekly_report",
-            "schedule": crontab(hour=8, minute=0, day_of_week=1),  # segunda 8h BRT
+            "schedule": crontab(hour=8, minute=0, day_of_week=1),
             "options": {"queue": "learning"},
         },
-        # ── BACKUP: 4x por dia em horários fixos ──
         "daily-backup": {
             "task": "app.queues.tasks.daily_backup",
-            "schedule": crontab(hour="0,6,12,18", minute=0),  # 0h, 6h, 12h, 18h BRT
+            "schedule": crontab(hour="0,6,12,18", minute=0),
             "options": {"queue": "learning"},
         },
-        # ── OPS: monitoramento autônomo ──
         "health-check": {
             "task": "app.queues.tasks.health_check",
-            "schedule": 1800.0,  # a cada 30 min (intervalo curto, ok)
+            "schedule": 1800.0,
             "options": {"queue": "learning"},
         },
         "daily-ops-report": {
             "task": "app.queues.tasks.daily_ops_report",
-            "schedule": crontab(hour="1,7,13,19", minute=0),  # 4x ao dia em horários fixos
+            "schedule": crontab(hour="1,7,13,19", minute=0),
             "options": {"queue": "learning"},
         },
-        # ── AGENTES AUTÔNOMOS: Sentinel a cada 5 min ──
         "sentinel-monitor": {
             "task": "app.queues.tasks.sentinel_monitor",
-            "schedule": 300.0,  # a cada 5 minutos
+            "schedule": 300.0,
             "options": {"queue": "learning"},
         },
     },
 )
+
 
 def run_async(coro):
     loop = asyncio.new_event_loop()
@@ -184,7 +166,6 @@ def process_message(self, phone: str, owner_id: str, message: str, agent_mode: s
                     message_id: str = "", media_type: str = "text"):
     try:
         kwargs = {"message_id": message_id, "media_type": media_type}
-        # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
         run_async(_dispatch_to_agent(phone, owner_id, message, agent_mode, **kwargs))
     except Exception as exc:
         logger.error(f"Erro ao processar mensagem de {phone}: {exc}", exc_info=True)
@@ -223,7 +204,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                 logger.info(f"[Buffer] Mensagens vazias de {phone}, ignorando")
                 return
             kwargs = {"message_id": msgs[-1].get("message_id", ""), "media_type": "text"}
-            # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
             run_async(_dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs))
             return
 
@@ -231,7 +211,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
             m = media_msgs[0]
             msg_text = text_parts[0] if text_parts else (m.get("text") or "")
             kwargs = {"message_id": m.get("message_id", ""), "media_type": m.get("media_type", "text")}
-            # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
             run_async(_dispatch_to_agent(phone, owner_id, msg_text, agent_mode, **kwargs))
             return
 
@@ -249,7 +228,6 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
                 if not b64:
                     descriptions.append(f"[Mídia {i}: não foi possível baixar]")
                     continue
-
                 if mtype == "image":
                     desc = run_async(ai.respond_with_image(
                         system_prompt="Descreva esta imagem em 1-2 frases objetivas: o que é, marca, detalhes visíveis. Só a descrição, sem comentários.",
@@ -273,11 +251,7 @@ def process_buffered(self, phone: str, owner_id: str, agent_mode: str):
             return
 
         last_msg = msgs[-1]
-        kwargs = {
-            "message_id": last_msg.get("message_id", ""),
-            "media_type": "text"
-        }
-        # _dispatch_to_agent é async — DEVE ser envolvida com run_async()
+        kwargs = {"message_id": last_msg.get("message_id", ""), "media_type": "text"}
         run_async(_dispatch_to_agent(phone, owner_id, combined_text, agent_mode, **kwargs))
 
     except Exception as exc:
@@ -291,8 +265,7 @@ def follow_up_active(self, phone: str, owner_id: str):
     """Follow-up de conversa ativa — cliente silenciou no meio de uma troca.
 
     Aciona 5 min após a última mensagem do lead.
-    Gera uma pergunta contextual via IA ("ficou alguma dúvida?",
-    "ainda está por aí?", etc.) baseada nos últimos turnos da conversa.
+    Gera pergunta contextual via IA baseada nos últimos turnos da conversa.
     NÃO usa nome do cliente para evitar erros de cadastro.
     Cancelado automaticamente se o lead responder antes do timeout.
     """
@@ -304,7 +277,6 @@ def follow_up_active(self, phone: str, owner_id: str):
 
         r = _redis_lib.from_url(settings.redis_url, decode_responses=True)
 
-        # Verifica se lead respondeu depois que a task foi agendada
         ts_key = f"last_lead_msg:{phone}:{owner_id}"
         fu_key = f"followup_sent:{phone}:{owner_id}"
 
@@ -316,13 +288,12 @@ def follow_up_active(self, phone: str, owner_id: str):
         last_ts = r.get(ts_key)
         if last_ts:
             elapsed = _time.time() - float(last_ts)
-            if elapsed < 240:  # menos de 4 min = lead acabou de responder
+            if elapsed < 240:
                 logger.info(f"[Follow-up Active] Lead {phone} respondeu há {elapsed:.0f}s — pulando")
                 return
 
         db = get_db()
 
-        # Busca dados do lead (inclui summary para contexto)
         customer_resp = db.table("customers").select(
             "name, lead_status, lead_score, summary"
         ).eq("phone", phone).eq("owner_id", owner_id).limit(1).execute()
@@ -333,14 +304,13 @@ def follow_up_active(self, phone: str, owner_id: str):
 
         customer = customer_resp.data[0]
 
-        # Não interrompe atendimento humano
         if customer.get("lead_status") == "em_atendimento_humano":
             logger.info(f"[Follow-up Active] {phone} em atendimento humano — pulando")
             return
 
-        # Busca dados do tenant
+        # Colunas reais de tenants: context_summary, bot_tone, business_name
         owner_resp = db.table("tenants").select(
-            "evolution_instance, business_name, context_summary, main_offer"
+            "evolution_instance, business_name, context_summary, bot_tone"
         ).eq("id", owner_id).limit(1).execute()
 
         if not owner_resp.data:
@@ -354,7 +324,7 @@ def follow_up_active(self, phone: str, owner_id: str):
             logger.warning(f"[Follow-up Active] Tenant {owner_id} sem evolution_instance — pulando")
             return
 
-        # Busca histórico recente para gerar mensagem contextual
+        # Busca histórico recente para contextualizar a mensagem
         history = []
         try:
             msgs_resp = db.table("messages").select(
@@ -367,13 +337,11 @@ def follow_up_active(self, phone: str, owner_id: str):
         except Exception as e:
             logger.warning(f"[Follow-up Active] Erro ao buscar histórico de {phone}: {e}")
 
-        # Gera mensagem contextual via IA (sem nome, evita erros de cadastro)
         msg = _generate_active_followup(customer, owner, history)
 
         wa_svc = WhatsAppService()
         run_async(wa_svc.send_message(phone, msg, instance=evolution_instance))
 
-        # Marca que já enviou (TTL 1h para não spam)
         r.setex(fu_key, 3600, "1")
         logger.info(f"[Follow-up Active] Enviado para {phone}: '{msg[:60]}'")
 
@@ -383,92 +351,114 @@ def follow_up_active(self, phone: str, owner_id: str):
 
 
 def _generate_active_followup(customer: dict, owner: dict, history: list) -> str:
-    """Gera mensagem de follow-up contextual via IA.
+    """Gera mensagem de follow-up contextual para conversa ativa.
 
-    Analisa os últimos turnos da conversa e produz uma frase natural
-    para retomar o contato: "ficou alguma dúvida?", "ainda está por aí?",
-    ou algo específico sobre o assunto que estava sendo discutido.
-    Fallback para mensagem genérica se a IA falhar.
+    Usa os últimos turnos da conversa para gerar uma pergunta natural:
+    'ficou alguma dúvida?', 'ainda está por aí?', ou algo específico
+    sobre o assunto discutido. Fallback genérico sem nome se IA falhar.
     """
     try:
         from app.services.ai import AIService
 
         summary = customer.get("summary") or ""
-        main_offer = owner.get("main_offer") or ""
         context_summary = owner.get("context_summary") or ""
+        bot_tone = owner.get("bot_tone") or "amigável e direto"
 
-        # Monta trecho da conversa para dar contexto à IA
         context_lines = []
-        for m in history[-4:]:  # últimas 4 mensagens
+        for m in history[-4:]:
             role = "Cliente" if m.get("role") == "user" else "Atendente"
             content = (m.get("content") or "")[:120].replace("\n", " ")
             context_lines.append(f"{role}: {content}")
         context_text = "\n".join(context_lines)
 
-        # Sem nenhum histórico nem resumo → mensagem genérica simples
         if not context_text and not summary:
             return "ainda posso te ajudar com algo? 😊"
 
         system = (
-            "Você é um atendente de WhatsApp humanizado. "
+            f"Você é um atendente de WhatsApp com tom {bot_tone}. "
             "O cliente ficou em silêncio no meio de uma conversa. "
-            "Gere UMA mensagem curta (máximo 2 frases) para retomar o contato de forma natural — "
-            "como um humano faria, sem soar robótico. "
-            "Use o contexto da conversa: se foi falado de um produto específico, pergunte sobre ele. "
-            "Exemplos de tom: 'ficou alguma dúvida?', 'ainda está por aí? 😊', "
-            "'posso te ajudar com mais alguma coisa?', 'me fala se tiver dúvida!'. "
-            "REGRAS: NÃO use o nome do cliente. NÃO invente informações. "
-            "NÃO comece com saudação (sem oi, olá). "
-            "Responda APENAS a mensagem pronta, sem aspas, sem explicação."
+            "Gere UMA mensagem curta (máximo 2 frases) para retomar o contato de forma natural. "
+            "Use o contexto: se foi discutido algo específico, pergunte sobre aquilo. "
+            "Exemplos: 'ficou alguma dúvida?', 'ainda está por aí? 😊', "
+            "'posso te ajudar com mais alguma coisa?'. "
+            "NÃO use o nome do cliente. NÃO invente informações. "
+            "NÃO comece com saudação. Responda APENAS a mensagem pronta."
         )
 
-        user_msg_parts = []
+        parts = []
         if context_text:
-            user_msg_parts.append(f"Trecho da conversa:\n{context_text}")
+            parts.append(f"Trecho da conversa:\n{context_text}")
         if summary:
-            user_msg_parts.append(f"Resumo do cliente: {summary[:200]}")
-        if main_offer:
-            user_msg_parts.append(f"Produto/serviço em pauta: {main_offer[:100]}")
-        user_msg_parts.append("Gere a mensagem de follow-up:")
-
-        user_msg = "\n\n".join(user_msg_parts)
+            parts.append(f"Resumo do cliente: {summary[:200]}")
+        if context_summary:
+            parts.append(f"Contexto do negócio: {context_summary[:150]}")
+        parts.append("Gere a mensagem de follow-up:")
 
         ai = AIService()
         result = run_async(ai.respond(
             system_prompt=system,
             history=[],
-            user_message=user_msg
+            user_message="\n\n".join(parts)
         ))
 
         if result and len(result.strip()) > 3:
             return result.strip()
 
     except Exception as e:
-        logger.warning(f"[Follow-up Active] IA falhou ao gerar mensagem contextual: {e}")
+        logger.warning(f"[Follow-up Active] IA falhou: {e}")
 
-    # Fallback: mensagem genérica sem nome
     return "ainda posso te ajudar com algo? 😊"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CONFIGURAÇÃO DOS ESTÁGIOS DE FOLLOW-UP FRIO
+# ─────────────────────────────────────────────────────────────────────────
+# Estágio: (dias_desde_last_contact, cooldown_desde_last_nurture, é_final)
+_COLD_STAGES = {
+    0: {"contact_days": 3,  "nurture_cooldown_days": 3,  "final": False},  # 1º toque: dúvidas da conversa
+    1: {"contact_days": 7,  "nurture_cooldown_days": 4,  "final": False},  # 2º toque: valor/disponibilidade
+    2: {"contact_days": 15, "nurture_cooldown_days": 7,  "final": True},   # 3º toque: encerramento gentil
+}
+
+# Mensagens fallback por estágio (quando IA falha ou sem contexto)
+_COLD_FALLBACKS = {
+    0: "oi! vi que conversamos há alguns dias — ficou com alguma dúvida? 😊",
+    1: "ainda posso te ajudar? tenho disponibilidade pra conversar quando quiser.",
+    2: "vou deixar nossa conversa em aberto — é só me chamar quando quiser 😊",
+}
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
 @with_ops_alert("follow_up_cold_leads")
 def follow_up_cold_leads(self):
-    """Follow-up de leads frios — itera todos os tenants (beat sem args)."""
+    """Follow-up de leads frios em 3 estágios progressivos.
+
+    Estágio 0 → 1 (3 dias):  leve, verifica dúvidas da conversa anterior
+    Estágio 1 → 2 (7 dias):  direto, ângulo de valor/disponibilidade
+    Estágio 2 → 3 (15 dias): encerramento gentil, porta aberta
+    Após estágio 3: nurture_paused=True — ciclo encerrado
+
+    Reinicia automaticamente quando cliente responde
+    (webhook já reseta follow_up_stage=0 e nurture_paused=False).
+    """
     try:
         from app.database import get_db
         from app.services.whatsapp import WhatsAppService
+        from app.services.ai import AIService
         from app.services.ops import save_progress, get_progress, clear_progress
         from datetime import datetime, timedelta
 
         db = get_db()
         wa_svc = WhatsAppService()
+        ai_svc = AIService()
+        now = datetime.utcnow()
 
-        # Retomada: checa se tem progresso salvo
         progress = get_progress("follow_up_cold_leads")
         processed_owners = set(progress.get("done", [])) if progress else set()
 
-        # Lê da tabela tenants (owners está vazia/obsoleta)
-        owners_resp = db.table("tenants").select("id, owner_phone, evolution_instance").execute()
+        owners_resp = db.table("tenants").select(
+            "id, owner_phone, evolution_instance, business_name, context_summary, bot_tone"
+        ).execute()
         owners = []
         for row in (owners_resp.data or []):
             r = dict(row)
@@ -478,8 +468,6 @@ def follow_up_cold_leads(self):
         if not owners:
             logger.info("[Follow-up Cold] Nenhum tenant encontrado")
             return
-
-        cold_threshold = datetime.utcnow() - timedelta(days=7)
 
         for owner in owners:
             owner_id = owner["id"]
@@ -494,41 +482,181 @@ def follow_up_cold_leads(self):
                 continue
 
             try:
-                resp = db.table("customers").select("phone, name").eq(
-                    "owner_id", owner_id
-                ).lt(
-                    "last_contact", cold_threshold.isoformat()
-                ).neq(
-                    "lead_score", "client"
-                ).limit(20).execute()
+                sent_count = 0
 
-                cold_leads = resp.data or []
-                if not cold_leads:
-                    processed_owners.add(owner_id)
-                    save_progress("follow_up_cold_leads", {"done": list(processed_owners)})
-                    continue
+                # Itera cada estágio separadamente
+                for stage, cfg in _COLD_STAGES.items():
+                    contact_threshold = now - timedelta(days=cfg["contact_days"])
+                    nurture_cooldown = now - timedelta(days=cfg["nurture_cooldown_days"])
 
-                logger.info(f"[Follow-up Cold] {len(cold_leads)} leads frios para tenant {owner_id}")
+                    resp = db.table("customers").select(
+                        "phone, name, summary, follow_up_stage, last_nurture, lead_status"
+                    ).eq("owner_id", owner_id).eq(
+                        "follow_up_stage", stage
+                    ).eq(
+                        "nurture_paused", False
+                    ).lt(
+                        "last_contact", contact_threshold.isoformat()
+                    ).neq(
+                        "lead_status", "cliente"
+                    ).neq(
+                        "lead_status", "em_atendimento_humano"
+                    ).limit(20).execute()
 
-                for lead in cold_leads:
-                    try:
-                        name = lead.get("name") or "você"
-                        msg = f"Oi {name}! Faz um tempo que não conversamos. Posso te ajudar com algo? 😊"
-                        run_async(wa_svc.send_message(lead["phone"], msg, instance=evolution_instance))
-                    except Exception as e:
-                        logger.error(f"[Follow-up Cold] Erro ao enviar para {lead.get('phone')}: {e}")
+                    leads = resp.data or []
 
-                processed_owners.add(owner_id)
-                save_progress("follow_up_cold_leads", {"done": list(processed_owners)})
+                    # Filtra leads onde last_nurture é recente demais
+                    leads_eligible = []
+                    for lead in leads:
+                        last_nurture = lead.get("last_nurture")
+                        if last_nurture:
+                            try:
+                                ln_str = str(last_nurture).replace("Z", "+00:00")
+                                ln_dt = datetime.fromisoformat(ln_str)
+                                # Remove timezone para comparar com utcnow
+                                if ln_dt.tzinfo is not None:
+                                    from datetime import timezone
+                                    ln_dt = ln_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                                if ln_dt > nurture_cooldown:
+                                    continue  # enviado recente demais
+                            except Exception:
+                                pass
+                        leads_eligible.append(lead)
+
+                    if not leads_eligible:
+                        continue
+
+                    logger.info(
+                        f"[Follow-up Cold] Stage {stage}: {len(leads_eligible)} leads "
+                        f"para tenant {owner_id[:8]}"
+                    )
+
+                    for lead in leads_eligible:
+                        try:
+                            msg = _generate_cold_followup(stage, lead, owner, ai_svc)
+                            run_async(wa_svc.send_message(
+                                lead["phone"], msg, instance=evolution_instance
+                            ))
+
+                            # Avança estágio e registra data
+                            new_stage = stage + 1
+                            update_data = {
+                                "follow_up_stage": new_stage,
+                                "last_nurture": now.isoformat(),
+                            }
+                            if cfg["final"]:
+                                update_data["nurture_paused"] = True
+                                logger.info(
+                                    f"[Follow-up Cold] {lead['phone']} — ciclo encerrado "
+                                    f"(3 estágios completos)"
+                                )
+
+                            db.table("customers").update(update_data).eq(
+                                "phone", lead["phone"]
+                            ).eq("owner_id", owner_id).execute()
+
+                            sent_count += 1
+                            logger.info(
+                                f"[Follow-up Cold] Stage {stage} enviado para "
+                                f"{lead['phone']}: '{msg[:50]}'"
+                            )
+
+                        except Exception as e:
+                            logger.error(
+                                f"[Follow-up Cold] Erro ao enviar para "
+                                f"{lead.get('phone')}: {e}"
+                            )
+
+                if sent_count:
+                    logger.info(
+                        f"[Follow-up Cold] Tenant {owner_id[:8]}: "
+                        f"{sent_count} mensagem(ns) enviada(s)"
+                    )
 
             except Exception as e:
                 logger.error(f"[Follow-up Cold] Erro ao processar tenant {owner_id}: {e}")
+
+            processed_owners.add(owner_id)
+            save_progress("follow_up_cold_leads", {"done": list(processed_owners)})
 
         clear_progress("follow_up_cold_leads")
 
     except Exception as exc:
         logger.error(f"Erro no follow-up de leads frios: {exc}")
         raise self.retry(exc=exc)
+
+
+def _generate_cold_followup(stage: int, lead: dict, owner: dict, ai_svc) -> str:
+    """Gera mensagem de reengajamento por estágio.
+
+    Estágio 0: leve, verifica dúvidas da conversa anterior
+    Estágio 1: direto, ângulo de valor/disponibilidade
+    Estágio 2: encerramento gentil, porta aberta
+    Fallback hardcoded por estágio se IA falhar.
+    """
+    summary = lead.get("summary") or ""
+    context_summary = owner.get("context_summary") or ""
+    bot_tone = owner.get("bot_tone") or "amigável e direto"
+    name = lead.get("name") or ""
+
+    stage_instructions = {
+        0: (
+            "Tom: leve e curioso, sem pressão. "
+            "Objetivo: verificar se ficou alguma dúvida da conversa anterior. "
+            "Exemplo de saída: 'oi! vi que conversamos há alguns dias — ficou com alguma dúvida?'"
+        ),
+        1: (
+            "Tom: direto e útil, voltado a valor. "
+            "Objetivo: reengajar mostrando disponibilidade ou trazendo algum ângulo novo. "
+            "Exemplo de saída: 'ainda posso te ajudar! tenho disponibilidade quando quiser conversar.'"
+        ),
+        2: (
+            "Tom: gentil e sem pressão, encerramento natural. "
+            "Objetivo: última tentativa, deixar a porta aberta sem cobrar. "
+            "Exemplo de saída: 'vou deixar nossa conversa em aberto — é só me chamar quando quiser 😊'"
+        ),
+    }
+
+    instruction = stage_instructions.get(stage, stage_instructions[2])
+
+    # Tenta gerar via IA se tiver contexto
+    if summary or context_summary:
+        try:
+            system = (
+                f"Você é um atendente de WhatsApp com tom {bot_tone}. "
+                "Gere UMA mensagem curta (máximo 2 frases) de reengajamento para um lead silencioso. "
+                f"{instruction} "
+                "NÃO use o nome do cliente. NÃO invente informações. "
+                "NÃO comece com saudação formal. Responda APENAS a mensagem pronta."
+            )
+
+            parts = []
+            if summary:
+                parts.append(f"Histórico do cliente: {summary[:200]}")
+            if context_summary:
+                parts.append(f"Contexto do negócio: {context_summary[:200]}")
+            parts.append("Gere a mensagem de reengajamento:")
+
+            result = run_async(ai_svc.respond(
+                system_prompt=system,
+                history=[],
+                user_message="\n\n".join(parts)
+            ))
+
+            if result and len(result.strip()) > 3:
+                # Estágio final não usa nome (encerramento impessoal funciona melhor)
+                if name and stage < 2:
+                    return f"{name}, {result.strip()}"
+                return result.strip()
+
+        except Exception as e:
+            logger.warning(f"[Follow-up Cold] IA falhou no stage {stage}: {e}")
+
+    # Fallback hardcoded por estágio
+    fallback = _COLD_FALLBACKS.get(stage, _COLD_FALLBACKS[2])
+    if name and stage < 2:
+        return f"{name}, {fallback}"
+    return fallback
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=5, queue="messages")
@@ -546,7 +674,6 @@ def nurture_customers(self):
         progress = get_progress("nurture_customers")
         processed_owners = set(progress.get("done", [])) if progress else set()
 
-        # Lê da tabela tenants (owners está vazia/obsoleta)
         owners_resp = db.table("tenants").select("id, owner_phone, evolution_instance").execute()
         owners = []
         for row in (owners_resp.data or []):
@@ -675,7 +802,6 @@ def nightly_learning_all(self):
         progress = get_progress("nightly_learning_all")
         done_ids = set(progress.get("done", [])) if progress else set()
 
-        # Lê da tabela tenants (owners está vazia/obsoleta)
         from app.database import get_db
         db = get_db()
         resp = db.table("tenants").select("id").execute()
@@ -684,7 +810,10 @@ def nightly_learning_all(self):
         from app.services.learning import LearningService
         learning_svc = LearningService()
 
-        logger.info(f"[Nightly Learning All] Processando {len(all_owners)} tenant(s), {len(done_ids)} já feitos")
+        logger.info(
+            f"[Nightly Learning All] Processando {len(all_owners)} tenant(s), "
+            f"{len(done_ids)} já feitos"
+        )
 
         for oid in all_owners:
             if oid in done_ids:
@@ -730,8 +859,7 @@ def daily_web_search(self):
 
         logger.info(
             "[WebSearch] Iniciando ciclo diário — %d tenant(s) × %d roles",
-            len(all_owners),
-            len(roles),
+            len(all_owners), len(roles),
         )
 
         for owner_id in all_owners:
@@ -744,21 +872,16 @@ def daily_web_search(self):
                 except Exception as e:
                     logger.error(
                         "[WebSearch] Erro no tenant %s role=%s: %s",
-                        owner_id[:8],
-                        role,
-                        e,
+                        owner_id[:8], role, e,
                     )
             logger.info(
                 "[WebSearch] Tenant %s concluído — %d insights salvos (%d roles)",
-                owner_id[:8],
-                tenant_saved,
-                len(roles),
+                owner_id[:8], tenant_saved, len(roles),
             )
 
         logger.info(
             "[WebSearch] Ciclo diário concluído — %d insights totais em %d tenant(s)",
-            total_saved,
-            len(all_owners),
+            total_saved, len(all_owners),
         )
 
     except Exception as exc:
@@ -809,7 +932,7 @@ def daily_backup(self):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TASKS DE OPS (monitoramento autônomo)
+#  TASKS DE OPS
 # ═══════════════════════════════════════════════════════════════════════════
 
 @celery_app.task(bind=True, max_retries=1, default_retry_delay=30, queue="learning")
@@ -822,7 +945,6 @@ def health_check(self):
         report = run_health_check()
 
         if report["overall"] != "healthy":
-            # Monta resumo dos problemas
             problems = []
             for comp, info in report.get("components", {}).items():
                 if info["status"] != "ok":
@@ -830,12 +952,8 @@ def health_check(self):
             for task, info in report.get("circuits", {}).items():
                 ttl = info.get("ttl_seconds", 0)
                 problems.append(f"Circuit `{task}` aberto ({ttl // 60}min restantes)")
-
             if problems:
-                notify_warn(
-                    f"Health Check — DEGRADADO\n\n"
-                    + "\n".join(problems)
-                )
+                notify_warn(f"Health Check — DEGRADADO\n\n" + "\n".join(problems))
 
         logger.info(f"[Health Check] Status: {report['overall']}")
 
@@ -865,7 +983,6 @@ def sentinel_monitor(self):
     """
     Ciclo de monitoramento autônomo do Sentinel.
     Roda a cada 5 minutos via Celery Beat.
-    Detecta anomalias, aciona Doctor se necessário.
     """
     try:
         from app.agents.registry import load_all_agents, get_agent
@@ -889,7 +1006,6 @@ def sentinel_monitor(self):
 
         logger.info("[sentinel_monitor] Status=%s, anomalias=%d", status, anomaly_count)
 
-        # Se houver anomalias críticas, aciona o Doctor imediatamente
         if anomaly_count > 0:
             doctor = get_agent("doctor")
             if doctor:
@@ -907,7 +1023,6 @@ def sentinel_monitor(self):
                 )
                 diagnosis = run_async(doctor.act(doctor_context))
 
-                # Se diagnóstico pronto para Surgeon, aciona
                 if diagnosis.get("ready_for_surgeon"):
                     surgeon = get_agent("surgeon")
                     if surgeon:
