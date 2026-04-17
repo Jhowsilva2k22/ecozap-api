@@ -109,12 +109,18 @@ celery_app.conf.update(
         "app.queues.tasks.daily_backup": {"queue": "learning"},
         "app.queues.tasks.health_check": {"queue": "learning"},
         "app.queues.tasks.daily_ops_report": {"queue": "learning"},
+        "app.queues.tasks.daily_web_search": {"queue": "learning"},  # busca autônoma
     },
     beat_schedule={
         # ── LEARNING: horário fixo, não reseta com deploy ──
         "nightly-learning-all": {
             "task": "app.queues.tasks.nightly_learning_all",
             "schedule": crontab(hour=3, minute=0),  # 3:00 AM BRT diário
+            "options": {"queue": "learning"},
+        },
+        "daily-web-search": {
+            "task": "app.queues.tasks.daily_web_search",
+            "schedule": crontab(hour=6, minute=0),  # 6:00 AM BRT diário — após o learning noturno
             "options": {"queue": "learning"},
         },
         # ── MENSAGENS: intervalos curtos (ok resetar) ──
@@ -566,6 +572,56 @@ def nightly_learning_all(self):
 
     except Exception as exc:
         logger.error(f"Erro no nightly learning all: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=60, queue="learning")
+@with_ops_alert("daily_web_search")
+def daily_web_search(self):
+    """
+    Busca autônoma diária — mantém os agentes atualizados com tendências de mercado.
+    Roda todo dia às 6h BRT, logo após o nightly_learning_all das 3h.
+
+    Fluxo:
+      1. Lê todos os tenants ativos
+      2. Para cada tenant: chama WebSearchService.search_and_learn()
+      3. Resultados salvos no knowledge_items como category='aprendizado'
+
+    Requisito: BRAVE_API_KEY configurada no Railway env.
+    Sem a chave, a task executa mas não faz buscas (aviso no log).
+    """
+    try:
+        from app.database import get_db
+        from app.services.web_search import WebSearchService
+
+        db = get_db()
+        resp = db.table("tenants").select("id").execute()
+        all_owners = [row["id"] for row in (resp.data or [])]
+
+        if not all_owners:
+            logger.info("[WebSearch] Nenhum tenant encontrado — pulando")
+            return
+
+        svc = WebSearchService()
+        total_saved = 0
+
+        logger.info("[WebSearch] Iniciando ciclo diário para %d tenant(s)", len(all_owners))
+
+        for owner_id in all_owners:
+            try:
+                saved = svc.search_and_learn(owner_id)
+                total_saved += saved
+            except Exception as e:
+                logger.error("[WebSearch] Erro no tenant %s: %s", owner_id[:8], e)
+
+        logger.info(
+            "[WebSearch] Ciclo diário concluído — %d insights salvos em %d tenant(s)",
+            total_saved,
+            len(all_owners),
+        )
+
+    except Exception as exc:
+        logger.error(f"Erro no daily_web_search: {exc}")
         raise self.retry(exc=exc)
 
 
